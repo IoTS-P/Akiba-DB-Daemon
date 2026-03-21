@@ -34,8 +34,8 @@ object DbDaemonServer {
                     }
                 }
                 install(WebSockets) {
-                    pingPeriod = 30.seconds
-                    timeout = 15.seconds
+                    pingPeriod = 15.seconds
+                    timeout = 120.seconds
                     contentConverter = JacksonWebsocketContentConverter(
                         jacksonObjectMapper()
                             .registerKotlinModule()

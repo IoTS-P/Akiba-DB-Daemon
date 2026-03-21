@@ -84,9 +84,13 @@ echo "[5] Open the instance: done"
 # 6. Create superuser
 # -----------------------------
 HBA_CONF="$PGDATA/pg_hba.conf"
-sudo sed -i "1ihost all $USER_NAME 127.0.0.1/32 trust" "$HBA_CONF"
-sudo sed -i "2ilocal all $USER_NAME trust" "$HBA_CONF"
-psql -p "$PORT" -d postgres -c "CREATE USER $USER_NAME SUPERUSER LOGIN;"
+# Add trust authentication for local connections BEFORE existing rules
+sudo sed -i "1ilocal all $USER_NAME trust" "$HBA_CONF"
+sudo sed -i "2ihost all $USER_NAME 127.0.0.1/32 trust" "$HBA_CONF"
+sudo sed -i "3ilocal all postgres trust" "$HBA_CONF"
+sudo sed -i "4ihost all postgres 127.0.0.1/32 trust" "$HBA_CONF"
+# Check if user exists before creating
+psql -p "$PORT" -d postgres -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '$USER_NAME') THEN CREATE USER $USER_NAME SUPERUSER LOGIN; END IF; END \$\$;"
 
 echo "[6] Create superuser: done"
 
@@ -106,6 +110,7 @@ pg1-user      = $USER_NAME
 pg1-path      = $PGDATA
 pg1-port      = $PORT
 EOF
+sudo -i -u postgres /usr/lib/postgresql/"$PG_MAJOR_VERSION"/bin/pg_ctl -D "$PGDATA" -w -l "$PGDATA/postmaster.log" restart
 sudo -u postgres pgbackrest --config="$BACKREST_CONF_PATH" --stanza="$INSTANCE_NAME" stanza-create
 
 # -----------------------------

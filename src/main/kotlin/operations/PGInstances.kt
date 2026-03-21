@@ -8,14 +8,20 @@ import io.ktor.server.request.header
 import io.ktor.server.websocket.DefaultWebSocketServerSession
 import io.ktor.server.websocket.receiveDeserialized
 import io.ktor.server.websocket.sendSerialized
+import io.ktor.websocket.CloseReason
 import io.ktor.websocket.Frame
+import io.ktor.websocket.close
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import org.iotsplab.akiba.dbDaemon.AbstractPostRoute
 import org.iotsplab.akiba.dbDaemon.AbstractWebsocketRoute
 import org.iotsplab.akiba.dbDaemon.DatabaseDaemon.Companion.config
+import org.iotsplab.akiba.dbDaemon.DatabaseDaemon.Companion.globalLogger
 import org.iotsplab.akiba.dbDaemon.RouteContext
 import org.iotsplab.akiba.dbDaemon.dbutil.UserDatabaseSession
 import org.iotsplab.akiba.dbDaemon.operations.PGInstances.CreateInstance.createLock
@@ -172,6 +178,7 @@ object PGInstances {
         val env = process.environment()
         env["INSTANCE_NAME"] = instanceName
         env["INSTANCE_ROOT"] = instanceRoot.toString()
+        env["BACKUP_ROOT"] = config.backupRoot
         env["USER_NAME"] = userName
         env["PORT"] = port.toString()
         val p = process.redirectErrorStream(true).start()
@@ -298,7 +305,7 @@ object PGInstances {
 
     object CreateInstance: AbstractWebsocketRoute() {
         override val path: String = "/ws/instance/create"
-        private val createLock: ReentrantLock = ReentrantLock()
+        private val createLock: Mutex = Mutex()
 
         data class CreateData (
             val token: String,
@@ -313,16 +320,19 @@ object PGInstances {
                 ?.let { throw AkibaWebsocketException("Instance ${data.instanceName} already exists") }
 
             try {
-                creatingInstances = data.instanceName
-                instances[data.instanceName] = createPsqlInstance(user, data.instanceName)
-                creatingInstances = data.instanceName
+                createLock.withLock {
+                    creatingInstances = data.instanceName
+                    withContext(Dispatchers.IO) {
+                        instances[data.instanceName] = createPsqlInstance(user, data.instanceName)
+                    }
+                    creatingInstances = null
+                    globalLogger.info("PostgreSQL instance ${data.instanceName} created for user $user")
+                }
             } catch (_: PGPortFullException) {
                 throw AkibaWebsocketException("No more ports available")
             } catch (e: IllegalStateException) {
                 throw AkibaWebsocketException("Instance ${data.instanceName} initialization failed:\n" +
                         "${e.message}")
-            } finally {
-                createLock.unlock()
             }
 
             session.sendSerialized(mapOf("msg" to "Instance ${data.instanceName} created"))

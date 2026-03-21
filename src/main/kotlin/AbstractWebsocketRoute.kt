@@ -41,7 +41,7 @@ abstract class AbstractWebsocketRoute {
                 close(CloseReason(CloseReason.Codes.PROTOCOL_ERROR, "Content error"))
             } catch(e: AkibaWebsocketException) {
                 close(CloseReason(CloseReason.Codes.PROTOCOL_ERROR, e.message))
-            } catch(e: Exception) {
+            } catch(e: Throwable) {
                 close(CloseReason(CloseReason.Codes.INTERNAL_ERROR, "Internal server error"))
                 globalLogger.error("Internal server error occurred on websocket $path: ${e.message}")
                 globalLogger.error(e.stackTraceToString())
