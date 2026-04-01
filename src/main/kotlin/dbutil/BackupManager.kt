@@ -10,21 +10,22 @@ import org.iotsplab.akiba.dbDaemon.DatabaseDaemon.Companion.config
 import org.iotsplab.akiba.dbDaemon.DatabaseDaemon.Companion.globalLogger
 import org.iotsplab.akiba.dbDaemon.operations.PGInstances
 import org.postgresql.ds.PGSimpleDataSource
-import java.nio.file.FileSystems
 import java.nio.file.Path
 import java.time.Instant
 import java.time.OffsetDateTime
+import java.time.format.DateTimeFormatter
 import java.util.TimeZone
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import kotlin.io.path.absolutePathString
-import kotlin.io.path.deleteExisting
 
 class BackupManager (
     val instanceName: String
 ) {
     val snapshotPath: Path = Path.of(DatabaseDaemon.Companion.config.backupRoot, instanceName)
-    private val allNodes: MutableMap<String, BackupNode> = mutableMapOf()
+    private val logicalBackups: MutableMap<String, BackupNode> = mutableMapOf()
+    private var physicalBackups: MutableMap<String, PhysicalBackupData>
+        = obtainPhysicalBackup().associateBy { it.label }.toMutableMap()
     private var rootNode: BackupNode? = null
     private var logicalPreviousNode: BackupNode? = null
 
@@ -104,8 +105,7 @@ class BackupManager (
             }
 
             // 2. All backups found in the database should be existent in the disk
-            val physicalBackups: MutableSet<PhysicalBackupData> = obtainPhysicalBackup()
-            checkDiskConsistency(physicalBackups)
+            checkDiskConsistency()
 
             // 3. All aliases of backups should be unique
             check(checkAliasUnique()) {
@@ -129,13 +129,9 @@ class BackupManager (
     }
 
     @Throws(IllegalStateException::class)
-    private fun checkDiskConsistency(physical: MutableSet<PhysicalBackupData>) {
-        val nodesOnTree: Set<String> = allNodes.filter {
-            (_, node) -> node.backupType != BackupType.FULL && !node.isExpired
-        }.keys.plus(rootNode!!.label)
-
+    private fun checkDiskConsistency() {
         // a. We cannot allow there exists any backup in the tree that is not in the disk
-        val noPhysical: Set<String> = nodesOnTree.minus(physical.map { it.label })
+        val noPhysical: List<String> = logicalBackups.map { it.key }.minus(physicalBackups.keys)
         if (noPhysical.isNotEmpty()) {
             throw IllegalStateException(
                 "Backup tree is inconsistent, please check your backup data. " +
@@ -146,8 +142,8 @@ class BackupManager (
         // b. We cannot allow there exists any backup that has different types in the database and the disk
         // Because we do not know which one is right, we cannot fix the data automatically
         val typeErrors: MutableSet<String> = mutableSetOf()
-        physical.forEach {
-            if (it.type != allNodes[it.label]!!.backupType)
+        physicalBackups.values.forEach {
+            if (it.type != logicalBackups[it.label]!!.backupType)
                 typeErrors.add(it.label)
         }
         if (typeErrors.isNotEmpty()) {
@@ -159,7 +155,7 @@ class BackupManager (
 
         // c. We cannot allow there exists any backup in the disk that is not in the tree
         // TODO: To automatically fix the database data according to output of `pgbackrest info`
-        val noLogical = physical.map { it.label }.minus(nodesOnTree)
+        val noLogical = physicalBackups.keys.minus(logicalBackups.map { it.key })
         if (noLogical.isNotEmpty()) {
             throw IllegalStateException(
                 "Backup tree is inconsistent, please check your backup data. " +
@@ -169,7 +165,7 @@ class BackupManager (
     }
 
     private fun checkAliasUnique(): Boolean {
-        return allNodes.values.mapNotNull { it.alias }.size == allNodes.values.mapNotNull { it.alias }.distinct().size
+        return logicalBackups.values.mapNotNull { it.alias }.size == logicalBackups.values.mapNotNull { it.alias }.distinct().size
     }
 
     /**
@@ -199,28 +195,28 @@ class BackupManager (
                         backupType = BackupType.valueOf(rs.getString("backup_type")),
                         createdAt = rs.getObject("created_at", OffsetDateTime::class.java)
                     )
-                    allNodes[node.label] = node
+                    logicalBackups[node.label] = node
                 }
             }
         }
 
-        if (allNodes.isEmpty()) {
+        if (logicalBackups.isEmpty()) {
             globalLogger.warn("No snapshot found, creating your first snapshot is highly recommended")
             return
         }
 
-        allNodes.forEach { (_, node) ->
+        logicalBackups.forEach { (_, node) ->
             if (node.backupType == BackupType.FULL)
                 return@forEach
-            val parent = allNodes[node.parent]
+            val parent = logicalBackups[node.parent]
                 ?: throw IllegalStateException(
                     "Database logical error: Parent of ${node.label} (${node.parent}) not found")
             parent.children.add(node)
         }
 
-        rootNode = allNodes.values.filter { it.parent == null && !it.isExpired }.maxBy { it.createdAt }
-        logicalPreviousNode = allNodes[PGInstances.instances[instanceName]!!.logicalPrior]
-            ?: allNodes.values.maxBy { it.createdAt }
+        rootNode = logicalBackups.values.filter { it.parent == null && !it.isExpired }.maxBy { it.createdAt }
+        logicalPreviousNode = logicalBackups[PGInstances.instances[instanceName]!!.logicalPrior]
+            ?: logicalBackups.values.maxBy { it.createdAt }
     }
 
     fun getLogicalData(): List<BackupNode> {
@@ -529,8 +525,8 @@ class BackupManager (
                 backupType = backupType,
                 createdAt = thisBackup.startTimestamp
             )
-            allNodes[logicPrior]!!.children.add(thisNode)
-            allNodes[thisBackup.label] = thisNode
+            logicalBackups[logicPrior]!!.children.add(thisNode)
+            logicalBackups[thisBackup.label] = thisNode
 
             return thisBackup.label
         }
@@ -543,8 +539,9 @@ class BackupManager (
                 ?: throw IllegalArgumentException("Backup $labelOrAlias not found in the database")
             if (target.isExpired) throw IllegalArgumentException("Backup $labelOrAlias is already expired")
 
+
             // Confirm again if this backup exists in the disk
-            findBackupInDisk(target.label)
+            val physicalTarget = findBackupInDisk(target.label)
                 ?: throw IllegalArgumentException("Backup $labelOrAlias not found in the disk")
 
             // When performing restoration, there should be no lock occupied for this instance
@@ -559,11 +556,13 @@ class BackupManager (
                 PGInstances.shutdownInstance(instanceName)
 
             // 2. Restore
+            // Using --type=time with the backup's stop timestamp to prevent WAL replay beyond the backup point
             val cmd = """
                 sudo -u postgres pgbackrest --stanza=${instanceName} \
                 --config=${backupDirectory.absolutePathString()}/pgbackrest.conf \
                 --delta --type=immediate --set=${target.label} restore
             """.trimIndent()
+            globalLogger.info("Restore command: $cmd")
             val process = ProcessBuilder("bash", "-c", cmd).redirectErrorStream(true).start()
             process.waitFor()
 
@@ -573,19 +572,11 @@ class BackupManager (
                     ${process.inputStream.bufferedReader().readText()}
                 """.trimIndent())
 
-            // 3. Remove file `recovery.signal` and restart the instance, to make the instance backup-able again
+            // 3. Restart the instance, to make the instance backup-able again
             // postgresql needed to read recovery.signal (although it may be empty) after restoration, or it will
             // refuse to start
             PGInstances.startInstance(instanceName)
             PGInstances.shutdownInstance(instanceName)
-
-            // Because recovery.signal is in the directory that owned by `postgres`, we need to use `sudo` to delete it
-            val deleteProcess = ProcessBuilder("sudo", "rm",
-                PGInstances.instanceRoot
-                    .resolve(instanceName)
-                    .resolve("recovery.signal").absolutePathString()
-            ).redirectErrorStream(true).start()
-            deleteProcess.waitFor()
 
             // 4. Update the logical prior backup
             PGInstances.instances[instanceName]!!.logicalPrior = target.label
@@ -593,8 +584,8 @@ class BackupManager (
     }
 
     private fun findBackup(labelOrAlias: String): BackupNode? {
-        allNodes[labelOrAlias] ?.let { return it }
-        allNodes.values.find { it.alias == labelOrAlias } ?.let { return it }
+        logicalBackups[labelOrAlias] ?.let { return it }
+        logicalBackups.values.find { it.alias == labelOrAlias } ?.let { return it }
         return null
     }
 
@@ -659,6 +650,7 @@ class BackupManager (
                 }),
                 TimeZone.getDefault().toZoneId()
             )
+
             return PhysicalBackupData(
                 label = label,
                 prior = prior,

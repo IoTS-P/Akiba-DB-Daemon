@@ -230,7 +230,9 @@ object PGInstances {
         startProcess.waitFor()
 
         if (!instanceIsOn(instanceName))
-            throw IllegalStateException("Instance $instanceName failed to start")
+            throw IllegalStateException("Instance $instanceName failed to start, process output: " +
+                startProcess.inputStream.bufferedReader().readText()
+            )
     }
 
     @Throws(IllegalArgumentException::class, IllegalStateException::class)
@@ -245,7 +247,9 @@ object PGInstances {
         shutdownProcess.waitFor()
 
         if (instanceIsOn(instanceName))
-            throw IllegalStateException("Instance $instanceName failed to stop")
+            throw IllegalStateException("Instance $instanceName failed to stop, process output: " +
+                shutdownProcess.inputStream.bufferedReader().readText()
+            )
     }
 
     @Throws(PGPortFullException::class)

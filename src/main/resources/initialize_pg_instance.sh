@@ -120,7 +120,7 @@ INSTANCE_CONF="$PGDATA/postgresql.conf"
 sudo sed -Ei '
 s/^#?(wal_level)\s*=.*/\1 = replica/;
 s/^#?(archive_mode)\s*=.*/\1 = on/;
-s|^#?(archive_command)\s*=.*|\1 = '\''pgbackrest --config='"$BACKUP_PATH"'/pgbackrest.conf --stanza='"$INSTANCE_NAME"'_base archive-push '"$PGDATA"'/%p'\''|;
+s|^#?(archive_command)\s*=.*|\1 = '\''pgbackrest --config='"$BACKUP_PATH"'/pgbackrest.conf --stanza='"$INSTANCE_NAME"' archive-push '"$PGDATA"'/%p'\''|;
 ' "$INSTANCE_CONF"
 
 # -----------------------------
