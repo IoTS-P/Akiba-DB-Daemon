@@ -1,7 +1,7 @@
 plugins {
     application
-    kotlin("jvm") version "2.1.20"
-    kotlin("plugin.serialization") version "2.1.20"
+    kotlin("jvm") version "2.3.20"
+    kotlin("plugin.serialization") version "2.3.20"
 }
 
 group = "org.iotsplab"
@@ -24,25 +24,25 @@ dependencies {
 
     implementation("info.picocli:picocli:4.7.7")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core-jvm:1.10.2")
-    implementation("org.apache.logging.log4j:log4j-api:2.24.3")
-    implementation("org.apache.logging.log4j:log4j-core:2.24.3")
+    implementation("org.apache.logging.log4j:log4j-api:2.25.4")
+    implementation("org.apache.logging.log4j:log4j-core:2.25.4")
 
     // Ktor server supports
     // implementation("io.netty:netty-transport-native-epoll:4.2.7.Final:linux-x86_64")
 
-    implementation(platform("io.ktor:ktor-bom:3.1.3"))
-    implementation("io.ktor:ktor-server:3.1.3")
-    implementation("io.ktor:ktor-server-netty:3.1.3")
-    implementation("io.ktor:ktor-server-websockets:3.1.3")
-    implementation("io.ktor:ktor-serialization-jackson-jvm:3.1.3")
+    implementation(platform("io.ktor:ktor-bom:3.4.2"))
+    implementation("io.ktor:ktor-server")
+    implementation("io.ktor:ktor-server-netty")
+    implementation("io.ktor:ktor-server-websockets")
+    implementation("io.ktor:ktor-serialization-jackson-jvm")
 
     // Jackson supports
-    implementation(platform("com.fasterxml.jackson:jackson-bom:2.20.1"))
+    implementation(platform("com.fasterxml.jackson:jackson-bom:2.21.2"))
     implementation("com.fasterxml.jackson.core:jackson-databind")
-    implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.20.1")
+    implementation("com.fasterxml.jackson.module:jackson-module-kotlin")
 
     // PostgreSQL
-    implementation("org.postgresql:postgresql:42.7.8")
+    implementation("org.postgresql:postgresql:42.7.10")
 }
 
 tasks.distZip {
