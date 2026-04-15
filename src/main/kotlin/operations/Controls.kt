@@ -64,7 +64,8 @@ object Controls {
                 PGInstances.tokenSessions.getResource(token, user)
             } catch (e: Exception) {
                 throw FastAccessException(
-                    HttpStatusCode.BadRequest.description("Get session failed: ${e.message}"))
+                    HttpStatusCode.BadRequest.description(
+                        "Get session failed: ${e.message} (${e.javaClass.simpleName})"))
             }
 
             dbSession?.let { PGInstances.tokenSessions.renew(token, user) }
