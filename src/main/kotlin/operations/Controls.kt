@@ -4,6 +4,7 @@ import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.request.header
 import org.iotsplab.akiba.dbDaemon.AbstractPostRoute
+import org.iotsplab.akiba.dbDaemon.DatabaseDaemon.Companion.globalLogger
 import org.iotsplab.akiba.dbDaemon.RouteContext
 import org.iotsplab.akiba.dbDaemon.RouteRegistry
 import org.iotsplab.akiba.dbDaemon.dbutil.UserDatabaseSession
@@ -63,6 +64,7 @@ object Controls {
             val dbSession: UserDatabaseSession? = try {
                 PGInstances.tokenSessions.getResource(token, user)
             } catch (e: Exception) {
+                globalLogger.error("Get session of $token failed: ${e.message} (${e.javaClass.simpleName})")
                 throw FastAccessException(
                     HttpStatusCode.BadRequest.description(
                         "Get session failed: ${e.message} (${e.javaClass.simpleName})"))

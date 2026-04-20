@@ -10,6 +10,7 @@ import java.sql.SQLException
 import java.time.Duration
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import kotlin.concurrent.withLock
 import kotlin.use
 
 class UserDatabaseSession (val instanceName: String) {
@@ -65,19 +66,28 @@ class UserDatabaseSession (val instanceName: String) {
         Duration.ofSeconds(DatabaseDaemon.Companion.config.maxLockWaitingTime.toLong())
     ) {
         override fun releaseHook(key: String, resource: Pair<ResourceData<String>, Connection?>, owner: String) {
-            resource.second!!.close()
+            resource.second?.close()
         }
 
         fun unlockAllOfOwner(owner: String) {
-            for (resource in resourcesOwned.keys) {
-                if (resourcesOwned[resource]?.first?.owner == owner)
-                    unlock(resource, owner)
+            val keysToUnlock = operationLock.withLock {
+                resourcesOwned.keys.toList().filter {
+                    resourcesOwned[it]?.first?.owner == owner
+                }
+            }
+            keysToUnlock.forEach { key ->
+                unlock(key, owner)
             }
         }
 
         fun renewAll() {
-            resourcesOwned.keys.forEach {
-                renew(it, resourcesOwned[it]!!.first.owner)
+            val keysToRenew = operationLock.withLock {
+                resourcesOwned.keys.toList().map { key ->
+                    key to resourcesOwned[key]!!.first.owner
+                }
+            }
+            keysToRenew.forEach { (key, owner) ->
+                renew(key, owner)
             }
         }
     }

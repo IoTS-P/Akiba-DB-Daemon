@@ -15,7 +15,9 @@ open class ResourceData<R> (
     val owner: R,
     val timer: AtomicReference<ScheduledFuture<*>?> = AtomicReference(null),
     @Volatile
-    var expireAt: Instant
+    var expireAt: Instant,
+    @Volatile
+    var renewId: Long = 0
 )
 
 /**
@@ -37,7 +39,7 @@ open class TimedResourceMap<K, V, R: Comparable<R>>(
             Thread(r, "resource-timeout").apply { isDaemon = true }
         }
     protected val resourcesOwned: ConcurrentHashMap<K, Pair<ResourceData<R>, V?>> = ConcurrentHashMap()
-    private val operationLock: ReentrantLock = ReentrantLock()
+    protected val operationLock: ReentrantLock = ReentrantLock()
 
     fun hasLockedResource(): Boolean = resourcesOwned.isNotEmpty()
 
@@ -78,7 +80,8 @@ open class TimedResourceMap<K, V, R: Comparable<R>>(
                             TimeUnit.MILLISECONDS
                         )
                     ),
-                    expireAt = calculateExpiry()
+                    expireAt = calculateExpiry(),
+                    renewId = 0
                 ) to otherData
             }
         }
@@ -86,40 +89,54 @@ open class TimedResourceMap<K, V, R: Comparable<R>>(
 
     @Throws(NotLockedException::class, NotOwnedException::class)
     open fun unlock(resourceKey: K, owner: R) {
-        val ownerInfo = resourcesOwned[resourceKey] ?: throw NotLockedException()
-
-        if (ownerInfo.first.owner != owner) throw NotOwnedException()
-        else {
-            val removed = resourcesOwned.remove(resourceKey)
-            removed?.first?.timer?.get()?.cancel(false)
-            removed?.let { releaseHook(resourceKey, resource = it, owner) }
+        operationLock.withLock {
+            val ownerInfo = resourcesOwned[resourceKey] ?: throw NotLockedException()
+            if (ownerInfo.first.owner != owner) throw NotOwnedException()
+            else {
+                val removed = resourcesOwned.remove(resourceKey)
+                removed?.first?.timer?.get()?.cancel(false)
+                removed?.let { releaseHook(resourceKey, resource = it, owner) }
+            }
         }
     }
 
     open fun renew(resourceKey: K, owner: R) {
-        val ownerInfo = resourcesOwned[resourceKey] ?: throw NotLockedException()
-        if (ownerInfo.first.owner != owner)   throw NotOwnedException()
-        else {
-            ownerInfo.first.expireAt = calculateExpiry()
-            ownerInfo.first.timer.get() ?.cancel(false)
-            ownerInfo.first.timer.set(
-                scheduler.schedule(
-                    { onTimeout(resourceKey, owner) },
-                    timeout.toMillis(),
-                    TimeUnit.MILLISECONDS
+        operationLock.withLock {
+            val ownerInfo = resourcesOwned[resourceKey] ?: throw NotLockedException()
+            if (ownerInfo.first.owner != owner) throw NotOwnedException()
+            else {
+                ownerInfo.first.expireAt = calculateExpiry()
+                ownerInfo.first.renewId++ // Invalidate old timeout callback
+                ownerInfo.first.timer.get()?.cancel(false)
+                ownerInfo.first.timer.set(
+                    scheduler.schedule(
+                        { onTimeout(resourceKey, owner) },
+                        timeout.toMillis(),
+                        TimeUnit.MILLISECONDS
+                    )
                 )
-            )
+            }
         }
     }
 
-    open fun onTimeout(resourceKey: K, owner: R) {
-        // Avoid race condition of `renew` and `onTimeout`
+    private fun onTimeout(resourceKey: K, owner: R) {
         val entry = resourcesOwned[resourceKey] ?: return
         if (entry.first.owner != owner) return
-        if (Instant.now().isBefore(entry.first.expireAt)) return
 
-        val removed = resourcesOwned.remove(resourceKey)
-        removed?.let { releaseHook(resourceKey, resource = it, owner) }
+        // Check if this timeout is still valid (renewId matches)
+        val capturedRenewId = entry.first.renewId
+        if (Instant.now().isBefore(entry.first.expireAt)) return
+        if (entry.first.renewId != capturedRenewId) return // Was renewed, skip
+
+        operationLock.withLock {
+            // Double-check after acquiring lock
+            val currentEntry = resourcesOwned[resourceKey] ?: return
+            if (currentEntry.first.renewId != capturedRenewId) return
+            if (Instant.now().isBefore(currentEntry.first.expireAt)) return
+
+            val removed = resourcesOwned.remove(resourceKey)
+            removed?.let { releaseHook(resourceKey, resource = it, owner) }
+        }
     }
 
     open fun releaseHook(key: K, resource: Pair<ResourceData<R>, V?>, owner: R) {}

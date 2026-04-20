@@ -41,6 +41,7 @@ import java.util.concurrent.locks.ReentrantLock
 import kotlin.io.path.absolute
 import kotlin.io.path.exists
 import kotlin.io.path.notExists
+import kotlin.concurrent.withLock
 import kotlin.jvm.Throws
 
 object PGInstances {
@@ -91,35 +92,28 @@ object PGInstances {
     ) {
         @Throws(NotLockedException::class, NotOwnedException::class)
         override fun unlock(resourceKey: UUID, owner: String) {
-            val ownerInfo: Pair<ResourceData<String>, UserDatabaseSession?>
-                = resourcesOwned[resourceKey] ?: throw NotLockedException()
+            operationLock.withLock {
+                val ownerInfo: Pair<ResourceData<String>, UserDatabaseSession?>
+                    = resourcesOwned[resourceKey] ?: throw NotLockedException()
 
-            if (ownerInfo.first.owner != owner) throw NotOwnedException()
-            else {
-                val removed = resourcesOwned.remove(resourceKey)
-                removed?.first?.timer?.get()?.cancel(false)
-                // Release all sessions owned
-                removed?.second?.tableSessions?.unlockAllOfOwner(owner)
+                if (ownerInfo.first.owner != owner) throw NotOwnedException()
+                else {
+                    val removed = resourcesOwned.remove(resourceKey)
+                    removed?.first?.timer?.get()?.cancel(false)
+                    // Release all sessions owned
+                    removed?.second?.tableSessions?.unlockAllOfOwner(owner)
+                }
             }
         }
 
         override fun renew(resourceKey: UUID, owner: String) {
-            super.renew(resourceKey, owner)
-            val ownerInfo = resourcesOwned[resourceKey] ?: throw NotLockedException()
-            if (ownerInfo.first.owner != owner)   throw NotOwnedException()
-            else
-                ownerInfo.second?.tableSessions?.renewAll()
-        }
-
-        override fun onTimeout(resourceKey: UUID, owner: String) {
-            // Avoid race condition of `renew` and `onTimeout`
-            val entry = resourcesOwned[resourceKey] ?: return
-            if (entry.first.owner != owner) return
-            if (Instant.now().isBefore(entry.first.expireAt)) return
-
-            val removed = resourcesOwned.remove(resourceKey)
-            // Release all sessions owned
-            removed?.second?.tableSessions?.unlockAllOfOwner(owner)
+            operationLock.withLock {
+                super.renew(resourceKey, owner)
+                val ownerInfo = resourcesOwned[resourceKey] ?: throw NotLockedException()
+                if (ownerInfo.first.owner != owner) throw NotOwnedException()
+                else
+                    ownerInfo.second?.tableSessions?.renewAll()
+            }
         }
 
         override fun releaseHook(key: UUID, resource: Pair<ResourceData<String>, UserDatabaseSession?>, owner: String) {
@@ -127,17 +121,18 @@ object PGInstances {
         }
 
         fun unlockAllOfOwner(owner: String) {
-            for (resource in resourcesOwned.keys) {
-                if (resourcesOwned[resource]?.first?.owner == owner)
-                    unlock(resource, owner)
+            val keysToUnlock = operationLock.withLock {
+                resourcesOwned.keys.toList().filter {
+                    resourcesOwned[it]?.first?.owner == owner
+                }
+            }
+            keysToUnlock.forEach { key ->
+                unlock(key, owner)
             }
         }
 
         fun instanceIsInUse(instanceName: String): Boolean {
-            for (resource in resourcesOwned.keys)
-                if (resourcesOwned[resource]?.second?.instanceName == instanceName)
-                    return true
-            return false
+            return resourcesOwned.values.any { it.second?.instanceName == instanceName }
         }
     }
 
@@ -300,7 +295,13 @@ object PGInstances {
             val token = UUID.fromString(ctx.header("Authorization"))
             val user = tokens[token]
                 ?: return HttpStatusCode.BadRequest.description("Token $token not found")
-            tokenSessions.unlockAllOfOwner(user)
+            try {
+                tokenSessions.unlock(token, user)
+            } catch (_: NotLockedException) {
+                // Session may have already timed out, ignore
+            } catch (_: NotOwnedException) {
+                return HttpStatusCode.BadRequest.description("Token not owned by user")
+            }
             return HttpStatusCode.OK.description("Logout successful")
         }
     }
