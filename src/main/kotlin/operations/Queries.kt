@@ -6,6 +6,7 @@ import io.ktor.http.HttpStatusCode
 import org.iotsplab.akiba.dbDaemon.AbstractPostRoute
 import org.iotsplab.akiba.dbDaemon.DatabaseDaemon.Companion.globalLogger
 import org.iotsplab.akiba.dbDaemon.RouteContext
+import org.postgresql.util.PGobject
 import java.sql.SQLException
 
 object Queries {
@@ -217,8 +218,10 @@ object Queries {
                         val rs = stmt.executeQuery()
                         if (rs.next()) {
                             val data = mutableMapOf<String, Any?>()
-                            for (i in 1..rs.metaData.columnCount)
-                                data[rs.metaData.getColumnName(i)] = rs.getObject(i)
+                            for (i in 1..rs.metaData.columnCount) {
+                                val obj = rs.getObject(i)
+                                data[rs.metaData.getColumnName(i)] = if (obj is PGobject) obj.value else rs.getObject(i)
+                            }
                             result.results.add(ModuleData(column, type, data[column]))
                         }
                     }
