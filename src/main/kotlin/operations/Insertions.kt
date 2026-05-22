@@ -13,8 +13,8 @@ import java.util.UUID
 object Insertions {
     const val DATABASE_INSERT_BINARY_COMMAND = """
         INSERT INTO binaries 
-        (original_path, checksum, size, arch, format, compiler_spec) 
-        VALUES (?, ?, ?, ?, ?, ?)
+        (original_path, checksum, size, arch, format, compiler_spec, source_id, source_module) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """
     const val DATABASE_INSERT_PROCESSED_BINARY_COMMAND = """
         INSERT INTO processed_binaries 
@@ -53,6 +53,13 @@ object Insertions {
             val arch: String,
             val format: String,
             val compilerSpec: String,
+            // Provenance for files imported at runtime by a module:
+            //   sourceId     = id of the binary being analyzed when this file was imported
+            //                  (null for top-level imports done by ImportManager)
+            //   sourceModule = simple class name of the importing AkibaModule
+            //                  (null for top-level imports done by ImportManager)
+            val sourceId: Int? = null,
+            val sourceModule: String? = null,
         )
 
         override val path: String = "/insert/insert_bin"
@@ -74,6 +81,14 @@ object Insertions {
                     it.setString(4, data.arch)
                     it.setString(5, data.format)
                     it.setString(6, data.compilerSpec)
+                    if (data.sourceId != null)
+                        it.setInt(7, data.sourceId)
+                    else
+                        it.setNull(7, java.sql.Types.INTEGER)
+                    if (data.sourceModule != null)
+                        it.setString(8, data.sourceModule)
+                    else
+                        it.setNull(8, java.sql.Types.VARCHAR)
                     it.executeUpdate()
                 }
             }

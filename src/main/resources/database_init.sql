@@ -34,7 +34,17 @@ CREATE TABLE IF NOT EXISTS binaries (
     size            INT8,                   -- file size (original file)
     arch            TEXT,                   -- architecture
     format          TEXT,                   -- binary format, like ELF, EXE, etc.
-    compiler_spec   TEXT                    -- compiler spec, like eabi, Visual studio, etc.
+    compiler_spec   TEXT,                   -- compiler spec, like eabi, Visual studio, etc.
+    -- For files that are imported at runtime by a module while analyzing another file:
+    -- `source_id`     records the id of the originating binary (the binary that was being
+    --                  analyzed when this file was imported), or NULL if this binary was
+    --                  imported as a top-level entry by `ImportManager`.
+    -- `source_module` records the simple class name of the AkibaModule that imported it,
+    --                  or NULL for top-level imports.
+    source_id       INTEGER REFERENCES binaries (id)
+                        ON DELETE SET NULL
+                        ON UPDATE CASCADE,
+    source_module   TEXT
 );
 
 SELECT assert_column_type('public', 'binaries', 'id', 'int4');
@@ -44,6 +54,17 @@ SELECT assert_column_type('public', 'binaries', 'size', 'int8');
 SELECT assert_column_type('public', 'binaries', 'arch', 'text');
 SELECT assert_column_type('public', 'binaries', 'format', 'text');
 SELECT assert_column_type('public', 'binaries', 'compiler_spec', 'text');
+SELECT assert_column_type('public', 'binaries', 'source_id', 'int4');
+SELECT assert_column_type('public', 'binaries', 'source_module', 'text');
+
+-- Backwards-compatible upgrade: add the two columns to a pre-existing
+-- `binaries` table that was created before these columns were introduced.
+ALTER TABLE binaries
+    ADD COLUMN IF NOT EXISTS source_id INTEGER REFERENCES binaries (id)
+        ON DELETE SET NULL
+        ON UPDATE CASCADE;
+ALTER TABLE binaries
+    ADD COLUMN IF NOT EXISTS source_module TEXT;
 
 
 -- Some binaries are processed when imported and may generate new files, so we need to save them
