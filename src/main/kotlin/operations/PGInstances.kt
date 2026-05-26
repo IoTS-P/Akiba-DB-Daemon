@@ -169,7 +169,15 @@ object PGInstances {
     @Throws(PGPortFullException::class, IllegalStateException::class)
     private fun createPsqlInstance(userName: String, instanceName: String): InstanceMetadata {
         val port = selectInstancePort()
-        val process = ProcessBuilder("resources/initialize_pg_instance.sh")
+        val scriptPath = File("resources/initialize_pg_instance.sh")
+        if (!scriptPath.exists()) {
+            throw IllegalStateException(
+                "Initialization script not found at ${scriptPath.absolutePath} " +
+                "(working dir = ${File(".").absolutePath}). The akiba_db_daemon distribution " +
+                "must be unpacked with its resources/ directory intact."
+            )
+        }
+        val process = ProcessBuilder("bash", scriptPath.path)
         val env = process.environment()
         env["INSTANCE_NAME"] = instanceName
         env["INSTANCE_ROOT"] = instanceRoot.toString()
@@ -177,11 +185,19 @@ object PGInstances {
         env["USER_NAME"] = userName
         env["PORT"] = port.toString()
         val p = process.redirectErrorStream(true).start()
+        // Capture once — we want to log the full output AND embed (a truncated form of) it
+        // in the IllegalStateException. Reading the stream twice would block.
+        val output = p.inputStream.bufferedReader().readText()
         p.waitFor()
-        if (p.exitValue() != 0)
-            throw IllegalStateException("Instance $instanceName initialization failed, output:\n" +
-                p.inputStream.bufferedReader().readText()
+        if (p.exitValue() != 0) {
+            globalLogger.error(
+                "Instance $instanceName initialization script (exit=${p.exitValue()}) full output:\n$output")
+            throw IllegalStateException(
+                "Instance $instanceName initialization failed (exit=${p.exitValue()}); " +
+                "see daemon log for full output. Tail: " +
+                output.lines().filter { it.isNotBlank() }.takeLast(3).joinToString(" | ")
             )
+        }
         return InstanceMetadata(port, userName, null)
     }
 
@@ -211,6 +227,34 @@ object PGInstances {
             "-U", instanceInfo.owner, "-d", instanceInfo.owner).start()
         process.waitFor()
         return process.exitValue() == 0
+    }
+
+    /**
+     * Returns true iff the cluster is currently in PostgreSQL recovery / hot-standby mode
+     * (i.e. `pg_is_in_recovery()` returns `t`). In that state every write transaction is
+     * rejected with `cannot execute ... in a read-only transaction`. Used by
+     * `BackupManager.restoreBackup` as a defence-in-depth check after a pgbackrest restore
+     * — if the cluster did not auto-promote despite `--target-action=promote`, we fall
+     * back to `pg_ctl promote`.
+     *
+     * Returns false (best-effort) if the instance is not yet accepting connections at all,
+     * or if the helper psql call itself errors out for any unrelated reason.
+     */
+    @Throws(IllegalArgumentException::class)
+    fun instanceIsInRecovery(instanceName: String): Boolean {
+        val instanceInfo = instances[instanceName]
+            ?: throw IllegalArgumentException("Instance $instanceName not found")
+        if (!instanceIsOn(instanceName)) return false
+        val process = ProcessBuilder(
+            "sudo", "-u", "postgres",
+            "psql", "-h", "127.0.0.1", "-p", instanceInfo.port.toString(),
+            "-U", instanceInfo.owner, "-d", instanceInfo.owner,
+            "-tAqc", "SELECT pg_is_in_recovery();"
+        ).redirectErrorStream(true).start()
+        process.waitFor()
+        if (process.exitValue() != 0) return false
+        val output = process.inputStream.bufferedReader().readText().trim()
+        return output.equals("t", ignoreCase = true) || output.equals("true", ignoreCase = true)
     }
 
     @Throws(IllegalArgumentException::class, IllegalStateException::class)

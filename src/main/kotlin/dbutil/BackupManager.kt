@@ -82,7 +82,7 @@ class BackupManager (
         backupDataSource = PGSimpleDataSource().apply {
             setUrl("jdbc:postgresql://localhost:5432/akiba_backup")
             user = "akiba"
-            password = "akiba"
+            password = "akiba123"
         }
 
         updateLogicalData()
@@ -556,11 +556,22 @@ class BackupManager (
                 PGInstances.shutdownInstance(instanceName)
 
             // 2. Restore
-            // Using --type=time with the backup's stop timestamp to prevent WAL replay beyond the backup point
+            // Using --type=immediate (replay WAL only as far as needed for the backup to be
+            // self-consistent) plus --target-action=promote so that, once PostgreSQL reaches
+            // the recovery target, it automatically promotes the cluster out of recovery and
+            // accepts read-write transactions. Without --target-action=promote, PG 12+
+            // defaults to `recovery_target_action = pause`, which leaves the cluster in
+            // hot-standby / read-only mode forever — every subsequent CREATE TABLE / INSERT
+            // (e.g. AkibaExample4 creating its result table at runtime in test_run.sh
+            // Step 12) would fail with `cannot execute CREATE TABLE in a read-only
+            // transaction`. The same recovery_target settings are persisted to
+            // postgresql.auto.conf by pgbackrest and will be honoured on every later start
+            // until they're cleared by a successful promotion, which `--target-action=promote`
+            // accomplishes on this very recovery pass.
             val cmd = """
                 sudo -u postgres pgbackrest --stanza=${instanceName} \
                 --config=${backupDirectory.absolutePathString()}/pgbackrest.conf \
-                --delta --type=immediate --set=${target.label} restore
+                --delta --type=immediate --target-action=promote --set=${target.label} restore
             """.trimIndent()
             globalLogger.info("Restore command: $cmd")
             val process = ProcessBuilder("bash", "-c", cmd).redirectErrorStream(true).start()
@@ -576,6 +587,44 @@ class BackupManager (
             // postgresql needed to read recovery.signal (although it may be empty) after restoration, or it will
             // refuse to start
             PGInstances.startInstance(instanceName)
+
+            // 3b. Defence-in-depth: even though the restore was launched with
+            //     `--target-action=promote`, some pgbackrest builds or configs may still
+            //     leave the cluster in recovery (e.g. when target-action is silently
+            //     overridden by a pg_hba/postgresql.auto.conf interaction). If the
+            //     cluster is still read-only after start, kick `pg_ctl promote` directly.
+            //     The blocking wait is short and bounded — we only do this in the rare
+            //     fallthrough case.
+            try {
+                val maxAttempts = 10
+                var attempt = 0
+                while (attempt < maxAttempts && PGInstances.instanceIsInRecovery(instanceName)) {
+                    val promoteProcess = ProcessBuilder(
+                        "sudo", "-i", "-u", "postgres",
+                        "/usr/lib/postgresql/${PGInstances.pgVer}/bin/pg_ctl",
+                        "-D", "${PGInstances.instanceRoot}/$instanceName", "-w", "promote"
+                    ).redirectErrorStream(true).start()
+                    promoteProcess.waitFor()
+                    if (promoteProcess.exitValue() != 0) {
+                        globalLogger.warn(
+                            "pg_ctl promote attempt ${attempt + 1} returned ${promoteProcess.exitValue()}, " +
+                            "output: ${promoteProcess.inputStream.bufferedReader().readText()}"
+                        )
+                    }
+                    Thread.sleep(200)
+                    attempt++
+                }
+                if (PGInstances.instanceIsInRecovery(instanceName)) {
+                    globalLogger.warn(
+                        "Instance $instanceName is still in recovery after $maxAttempts promote attempts; " +
+                        "subsequent writes (CREATE TABLE / INSERT) will fail with " +
+                        "`cannot execute ... in a read-only transaction`."
+                    )
+                }
+            } catch (e: Exception) {
+                globalLogger.warn("Promote fallback failed for $instanceName: ${e.message}")
+            }
+
             PGInstances.shutdownInstance(instanceName)
 
             // 4. Update the logical prior backup
