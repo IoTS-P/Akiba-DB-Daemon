@@ -3,12 +3,14 @@ package org.iotsplab.akiba.dbDaemon
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.response.respond
 import io.ktor.server.routing.*
+import org.iotsplab.akiba.dbDaemon.operations.AgentOps
 import org.iotsplab.akiba.dbDaemon.operations.Backups
 import org.iotsplab.akiba.dbDaemon.operations.Controls
 import org.iotsplab.akiba.dbDaemon.operations.Insertions
 import org.iotsplab.akiba.dbDaemon.operations.Modules
 import org.iotsplab.akiba.dbDaemon.operations.PGInstances
 import org.iotsplab.akiba.dbDaemon.operations.Queries
+import org.iotsplab.akiba.dbDaemon.operations.ScriptOps
 
 object RouteRegistry {
 
@@ -40,7 +42,51 @@ object RouteRegistry {
         PGInstances.ShutdownInstance,
         PGInstances.DeleteInstance,
 
-        Backups.PeekBackup
+        Backups.PeekBackup,
+
+        // Agent Framework routes
+        AgentOps.CreateSession,
+        AgentOps.GetSession,
+        AgentOps.ListSessions,
+        AgentOps.UpdateSession,
+
+        AgentOps.AppendMessages,
+        AgentOps.GetMessages,
+        AgentOps.DeleteMessagesFrom,
+
+        AgentOps.StoreMemory,
+        AgentOps.QueryMemories,
+
+        AgentOps.SaveContext,
+        AgentOps.LoadContext,
+
+        AgentOps.CreateGraph,
+        AgentOps.AddGraphNode,
+        AgentOps.AddGraphEdge,
+        AgentOps.LoadGraph,
+
+        AgentOps.RecordExecution,
+        AgentOps.GetExecutions,
+
+        AgentOps.RequestHumanInput,
+        AgentOps.RespondHumanInput,
+        AgentOps.PollHumanInputs,
+
+        AgentOps.RecordToolCall,
+
+        // Script routes
+        ScriptOps.CreateScript,
+        ScriptOps.GetScript,
+        ScriptOps.ListScripts,
+        ScriptOps.UpdateScript,
+        ScriptOps.UpdateScriptOutput,
+        ScriptOps.DeleteScript,
+
+        ScriptOps.CreateExecution,
+        ScriptOps.GetExecution,
+        ScriptOps.ListExecutions,
+        ScriptOps.UpdateExecution,
+        ScriptOps.DeleteOldExecutions
     )
 
     private val wsRoutes: List<AbstractWebsocketRoute> = listOf(

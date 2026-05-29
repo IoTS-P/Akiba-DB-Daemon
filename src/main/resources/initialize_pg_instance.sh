@@ -150,7 +150,26 @@ psql -p "$PORT" \
 echo "[8] SQL initialization completed successfully."
 
 # -----------------------------
-# 11. Stop the instance
+# 11. Execute Agent SQL
+# -----------------------------
+
+AGENT_DB_INIT_SQL="$(dirname "$0")/agent_database_init.sql"
+
+if [ -f "$AGENT_DB_INIT_SQL" ]; then
+    echo "Executing Agent SQL file '$AGENT_DB_INIT_SQL' on database '$INSTANCE_NAME'..."
+
+    psql -p "$PORT" \
+        --dbname="$INSTANCE_NAME" \
+        --set=ON_ERROR_STOP=on \
+        --file="$AGENT_DB_INIT_SQL"
+
+    echo "[8b] Agent SQL initialization completed successfully."
+else
+    echo "[8b] Agent SQL file not found, skipping."
+fi
+
+# -----------------------------
+# 12. Stop the instance
 # -----------------------------
 
 sudo -i -u postgres /usr/lib/postgresql/"$PG_MAJOR_VERSION"/bin/pg_ctl -D "$PGDATA" -m fast -w stop

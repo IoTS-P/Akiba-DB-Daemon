@@ -50,6 +50,7 @@ tasks.distZip {
         from("src/main/resources/initialize_pg_instance.sh") { fileMode = 0b111_101_101 } // 0755
         from("src/main/resources/initialize_pg_local.sh")    { fileMode = 0b111_101_101 } // 0755
         from("src/main/resources/database_init.sql")
+        from("src/main/resources/agent_database_init.sql")
         from("src/main/resources/backup_db_init.sql")
         from("src/main/resources/config.json")      // For Test
     }

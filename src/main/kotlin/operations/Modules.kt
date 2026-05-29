@@ -336,7 +336,7 @@ object Modules {
         )
 
         // TODO: Should we record tasks undone dynamically?
-        override suspend fun handle(ctx: RouteContext): Any? {
+        override suspend fun handle(ctx: RouteContext): Any {
             val req = ctx.receive<StartRequest>()
             val fa = try {
                 fastAccess(ctx)
