@@ -355,6 +355,7 @@ CREATE TABLE IF NOT EXISTS scripts (
     id               SERIAL PRIMARY KEY,
     name             VARCHAR(255) NOT NULL,
     description      TEXT DEFAULT '',
+    author           VARCHAR(255) DEFAULT '',
     code             TEXT NOT NULL,
     code_size        INTEGER DEFAULT 0,
     language         VARCHAR(20) DEFAULT 'kotlin',
@@ -370,6 +371,7 @@ CREATE TABLE IF NOT EXISTS scripts (
 SELECT assert_column_type('public', 'scripts', 'id',              'int4');
 SELECT assert_column_type('public', 'scripts', 'name',            'varchar');
 SELECT assert_column_type('public', 'scripts', 'description',     'text');
+SELECT assert_column_type('public', 'scripts', 'author',          'varchar');
 SELECT assert_column_type('public', 'scripts', 'code',            'text');
 SELECT assert_column_type('public', 'scripts', 'code_size',       'int4');
 SELECT assert_column_type('public', 'scripts', 'language',        'varchar');

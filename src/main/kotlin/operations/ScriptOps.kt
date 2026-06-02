@@ -26,13 +26,14 @@ object ScriptOps {
     //  Script CRUD
     // ============================================================
 
-    /** Create a new script record. */
+    /** Create a new script record (or update if same name+author exists). */
     object CreateScript : AbstractPostRoute() {
         override val path: String = "/script/create"
 
         data class Request(
             val name: String,
             val description: String = "",
+            val author: String = "",
             val code: String,
             val language: String = "kotlin",
             val saveResult: Boolean = true,
@@ -45,23 +46,70 @@ object ScriptOps {
 
             var scriptId: Int? = null
             fa.session.useDb { conn ->
+                // Check if a script with the same name already exists
+                conn.prepareStatement(
+                    "SELECT id, author FROM scripts WHERE name = ?"
+                ).use { ps ->
+                    ps.setString(1, req.name)
+                    val rs = ps.executeQuery()
+                    if (rs.next()) {
+                        val existingId = rs.getInt("id")
+                        val existingAuthor = rs.getString("author") ?: ""
+
+                        if (existingAuthor == req.author) {
+                            // Same author — update (overwrite)
+                            conn.prepareStatement(
+                                """
+                                UPDATE scripts SET description = ?, code = ?, code_size = ?,
+                                    language = ?, save_result = ?, max_output_size = ?,
+                                    status = 'pending', output = NULL, output_size = 0, finished_at = NULL
+                                WHERE id = ?
+                                """.trimIndent()
+                            ).use { ups ->
+                                ups.setString(1, req.description)
+                                ups.setString(2, req.code)
+                                ups.setInt(3, req.code.toByteArray().size)
+                                ups.setString(4, req.language)
+                                ups.setBoolean(5, req.saveResult)
+                                ups.setLong(6, req.maxOutputSize)
+                                ups.setInt(7, existingId)
+                                ups.executeUpdate()
+                            }
+                            scriptId = existingId
+                            return@useDb
+                        } else {
+                            // Different author — reject
+                            scriptId = -1  // sentinel for conflict
+                            return@useDb
+                        }
+                    }
+                }
+
+                // No existing script — insert new
                 conn.prepareStatement(
                     """
-                    INSERT INTO scripts (name, description, code, code_size, language, save_result, max_output_size)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO scripts (name, description, author, code, code_size, language, save_result, max_output_size)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     RETURNING id
                     """.trimIndent()
                 ).use { ps ->
                     ps.setString(1, req.name)
                     ps.setString(2, req.description)
-                    ps.setString(3, req.code)
-                    ps.setInt(4, req.code.toByteArray().size)
-                    ps.setString(5, req.language)
-                    ps.setBoolean(6, req.saveResult)
-                    ps.setLong(7, req.maxOutputSize)
+                    ps.setString(3, req.author)
+                    ps.setString(4, req.code)
+                    ps.setInt(5, req.code.toByteArray().size)
+                    ps.setString(6, req.language)
+                    ps.setBoolean(7, req.saveResult)
+                    ps.setLong(8, req.maxOutputSize)
                     val rs = ps.executeQuery()
                     if (rs.next()) scriptId = rs.getInt("id")
                 }
+            }
+
+            if (scriptId == -1) {
+                return HttpStatusCode.Conflict.description(
+                    "Script '${req.name}' already exists with a different author. Cannot overwrite."
+                )
             }
             return scriptId ?: HttpStatusCode.InternalServerError.description("Failed to create script")
         }
@@ -79,7 +127,7 @@ object ScriptOps {
             var result: Map<String, Any?>? = null
             fa.session.useDb { conn ->
                 conn.prepareStatement(
-                    "SELECT id, name, description, code, code_size, language, output, output_size, " +
+                    "SELECT id, name, description, author, code, code_size, language, output, output_size, " +
                     "status, save_result, max_output_size, created_at, finished_at " +
                     "FROM scripts WHERE id = ?"
                 ).use { ps ->
@@ -90,6 +138,7 @@ object ScriptOps {
                             "id" to rs.getInt("id"),
                             "name" to rs.getString("name"),
                             "description" to rs.getString("description"),
+                            "author" to rs.getString("author"),
                             "code" to rs.getString("code"),
                             "codeSize" to rs.getInt("code_size"),
                             "language" to rs.getString("language"),
@@ -124,7 +173,7 @@ object ScriptOps {
             val scripts = mutableListOf<Map<String, Any?>>()
             fa.session.useDb { conn ->
                 conn.prepareStatement(
-                    "SELECT id, name, description, code_size, language, status, " +
+                    "SELECT id, name, description, author, code_size, language, status, " +
                     "save_result, max_output_size, created_at, finished_at " +
                     "FROM scripts ORDER BY created_at DESC LIMIT ? OFFSET ?"
                 ).use { ps ->
@@ -136,6 +185,7 @@ object ScriptOps {
                             "id" to rs.getInt("id"),
                             "name" to rs.getString("name"),
                             "description" to rs.getString("description"),
+                            "author" to rs.getString("author"),
                             "codeSize" to rs.getInt("code_size"),
                             "language" to rs.getString("language"),
                             "status" to rs.getString("status"),
