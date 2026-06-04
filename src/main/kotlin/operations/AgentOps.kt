@@ -312,7 +312,7 @@ object AgentOps {
                     RETURNING message_id
                 """.trimIndent()
 
-                conn.prepareStatement(insertSql).use { ps ->
+                conn.prepareStatement(insertSql, java.sql.Statement.RETURN_GENERATED_KEYS).use { ps ->
                     for ((i, msg) in req.messages.withIndex()) {
                         ps.setString(1, req.sessionId)
                         ps.setInt(2, maxIndex + i + 1)
@@ -325,8 +325,9 @@ object AgentOps {
                         if (msg.tokenCount != null) ps.setInt(9, msg.tokenCount) else ps.setNull(9, java.sql.Types.INTEGER)
                         ps.addBatch()
                     }
-                    // Execute batch and collect IDs
-                    val rs = ps.executeQuery()
+                    // Execute batch and collect generated keys
+                    ps.executeBatch()
+                    val rs = ps.generatedKeys
                     while (rs.next()) ids.add(rs.getLong("message_id"))
                 }
             }
