@@ -16,7 +16,10 @@ object RouteRegistry {
 
     // Add routes here
     private val postRoutes: List<AbstractPostRoute> = listOf(
+        Queries.SelectIdPage,
+        Queries.SelectIdCount,
         Queries.GetBinaryMetadata,
+        Queries.SearchBinaries,
         Queries.GetModuleData,
         Queries.SelectIdInSQL,
 

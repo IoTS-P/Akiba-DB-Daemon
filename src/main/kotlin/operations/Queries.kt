@@ -48,6 +48,72 @@ object Queries {
         }
     }
 
+    /**
+     * Get a page of binary IDs ordered by id, with offset and limit.
+     *
+     * Accepts `{ "offset": 0, "limit": 20 }`. Both fields are integers and are
+     * passed through a parameterized query — no SQL injection risk.
+     */
+    object SelectIdPage : AbstractPostRoute() {
+        override val path: String = "/get/id/page"
+
+        @Throws(SQLException::class)
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val data = ctx.receive<Map<String, Int>>()
+            val offset = data["offset"] ?: 0
+            val limit = data["limit"] ?: 20
+            val ids: MutableList<Long> = mutableListOf()
+            val fa = try {
+                fastAccess(ctx)
+            } catch (e: FastAccessException) {
+                return e.code
+            }
+
+            fa.session.useDb { conn ->
+                conn.prepareStatement(
+                    "SELECT u.id FROM using_binaries u ORDER BY u.id LIMIT ? OFFSET ?"
+                ).use { stmt ->
+                    stmt.setInt(1, limit)
+                    stmt.setInt(2, offset)
+                    val rs = stmt.executeQuery()
+                    while (rs.next())
+                        ids.add(rs.getLong("id"))
+                }
+            }
+
+            return ids
+        }
+    }
+
+    /**
+     * Get total count of binary entries.
+     *
+     * Accepts an empty body. Returns a single integer.
+     */
+    object SelectIdCount : AbstractPostRoute() {
+        override val path: String = "/get/id/count"
+
+        @Throws(SQLException::class)
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val fa = try {
+                fastAccess(ctx)
+            } catch (e: FastAccessException) {
+                return e.code
+            }
+            var count: Long = 0
+            fa.session.useDb { conn ->
+                conn.prepareStatement(
+                    "SELECT COUNT(*) FROM using_binaries"
+                ).use { stmt ->
+                    val rs = stmt.executeQuery()
+                    if (rs.next())
+                        count = rs.getLong(1)
+                }
+            }
+            return count
+        }
+    }
+
     object GetBinaryMetadata : AbstractPostRoute() {
         override val path: String = "/get/metadata"
 
@@ -110,6 +176,76 @@ object Queries {
             }
 
             return metadata
+        }
+    }
+
+    /**
+     * Search binaries by name, id, architecture, or format.
+     *
+     * Accepts `{ "query": "search_term" }`. Returns matching binary IDs
+     * with basic metadata (name, arch, format, checksum).
+     *
+     * All user input goes through parameterized LIKE patterns — no SQL injection risk.
+     */
+    object SearchBinaries : AbstractPostRoute() {
+        override val path: String = "/get/search"
+
+        @Throws(SQLException::class)
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val data = ctx.receive<Map<String, String>>()
+            val query = (data["query"] ?: "").trim()
+            val fa = try {
+                fastAccess(ctx)
+            } catch (e: FastAccessException) {
+                return e.code
+            }
+
+            val results: MutableList<Map<String, Any?>> = mutableListOf()
+            val likePattern = "%$query%"
+
+            fa.session.useDb { conn ->
+                val sql = buildString {
+                    append("SELECT u.id, u.original_path, u.arch, u.format, u.compiler_spec, u.checksum ")
+                    append("FROM using_binaries u ")
+                    // If query is a number, also match by exact id
+                    val conditions = if (query.toLongOrNull() != null) {
+                        "WHERE u.id = ? OR u.original_path ILIKE ? OR u.arch ILIKE ? OR u.format ILIKE ?"
+                    } else if (query.isNotEmpty()) {
+                        "WHERE u.original_path ILIKE ? OR u.arch ILIKE ? OR u.format ILIKE ?"
+                    } else {
+                        ""
+                    }
+                    append(conditions)
+                    append(" ORDER BY u.id LIMIT 50")
+                }
+
+                conn.prepareStatement(sql).use { stmt ->
+                    var idx = 1
+                    if (query.toLongOrNull() != null) {
+                        stmt.setLong(idx++, query.toLong())
+                    }
+                    if (query.isNotEmpty()) {
+                        stmt.setObject(idx++, likePattern, java.sql.Types.VARCHAR)
+                        stmt.setObject(idx++, likePattern, java.sql.Types.VARCHAR)
+                        stmt.setObject(idx++, likePattern, java.sql.Types.VARCHAR)
+                    }
+                    val rs = stmt.executeQuery()
+                    while (rs.next()) {
+                        results.add(mapOf(
+                            "id" to rs.getLong("id"),
+                            "name" to (rs.getString("original_path")?.substringAfterLast("/")
+                                ?: rs.getString("original_path") ?: "unknown"),
+                            "originalPath" to rs.getString("original_path"),
+                            "arch" to rs.getString("arch"),
+                            "format" to rs.getString("format"),
+                            "compilerSpec" to rs.getString("compiler_spec"),
+                            "checksum" to rs.getString("checksum")
+                        ))
+                    }
+                }
+            }
+
+            return results
         }
     }
 
