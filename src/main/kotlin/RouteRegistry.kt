@@ -76,6 +76,9 @@ object RouteRegistry {
         AgentOps.PollHumanInputs,
 
         AgentOps.RecordToolCall,
+        AgentOps.FindToolCallResults,
+        AgentOps.GetToolCallResult,
+        AgentOps.AppendTranscript,
 
         // Script routes
         ScriptOps.CreateScript,

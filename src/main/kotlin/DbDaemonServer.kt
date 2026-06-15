@@ -31,6 +31,7 @@ object DbDaemonServer {
                         factory.setStreamReadConstraints(
                             StreamReadConstraints.builder().maxStringLength(200 * 1024 * 1024).build()
                         )
+                        configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
                     }
                 }
                 install(WebSockets) {

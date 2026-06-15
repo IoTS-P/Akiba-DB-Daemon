@@ -56,7 +56,8 @@ object AgentOps {
             val sessionName: String? = null,
             val binaryId: Int? = null,
             val moduleName: String? = null,
-            val modelName: String? = null
+            val modelName: String? = null,
+            val projectName: String? = null
         )
 
         override suspend fun handle(ctx: RouteContext): Any? {
@@ -67,8 +68,8 @@ object AgentOps {
             fa.session.useDb { conn ->
                 conn.prepareStatement(
                     """
-                    INSERT INTO agent_sessions (session_name, binary_id, module_name, model_name)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO agent_sessions (session_name, binary_id, module_name, model_name, project_name)
+                    VALUES (?, ?, ?, ?, ?)
                     RETURNING session_id
                     """.trimIndent()
                 ).use { ps ->
@@ -76,6 +77,7 @@ object AgentOps {
                     if (req.binaryId != null) ps.setInt(2, req.binaryId) else ps.setNull(2, java.sql.Types.INTEGER)
                     ps.setString(3, req.moduleName)
                     ps.setString(4, req.modelName)
+                    ps.setString(5, req.projectName)
                     val rs = ps.executeQuery()
                     if (rs.next()) sessionId = rs.getUUIDStr("session_id")
                 }
@@ -97,7 +99,7 @@ object AgentOps {
             fa.session.useDb { conn ->
                 conn.prepareStatement(
                     "SELECT session_id, session_name, status, binary_id, module_name, graph_id, " +
-                    "model_name, created_at, updated_at, resumed_at, completed_at " +
+                    "model_name, project_name, created_at, updated_at, resumed_at, completed_at, transcript " +
                     "FROM agent_sessions WHERE session_id = ?::uuid"
                 ).use { ps ->
                     ps.setString(1, sessionId)
@@ -114,7 +116,8 @@ object AgentOps {
                             "createdAt" to rs.getString("created_at"),
                             "updatedAt" to rs.getString("updated_at"),
                             "resumedAt" to rs.getString("resumed_at"),
-                            "completedAt" to rs.getString("completed_at")
+                            "completedAt" to rs.getString("completed_at"),
+                            "transcript" to rs.getString("transcript")
                         )
                     }
                 }
@@ -161,7 +164,7 @@ object AgentOps {
 
                 val where = if (conditions.isEmpty()) "" else "WHERE ${conditions.joinToString(" AND ")}"
                 val sql = "SELECT session_id, session_name, status, binary_id, module_name, " +
-                    "model_name, created_at, updated_at FROM agent_sessions $where " +
+                    "model_name, project_name, created_at, updated_at FROM agent_sessions $where " +
                     "ORDER BY updated_at DESC LIMIT ? OFFSET ?"
 
                 conn.prepareStatement(sql).use { ps ->
@@ -186,6 +189,7 @@ object AgentOps {
                             "binaryId" to rs.getObject("binary_id"),
                             "moduleName" to rs.getString("module_name"),
                             "modelName" to rs.getString("model_name"),
+                            "projectName" to rs.getString("project_name"),
                             "createdAt" to rs.getString("created_at"),
                             "updatedAt" to rs.getString("updated_at")
                         ))
@@ -205,7 +209,8 @@ object AgentOps {
             val status: String? = null,
             val sessionName: String? = null,
             val graphId: String? = null,
-            val modelName: String? = null
+            val modelName: String? = null,
+            val transcript: String? = null
         )
 
         override suspend fun handle(ctx: RouteContext): Any? {
@@ -225,6 +230,7 @@ object AgentOps {
             req.sessionName?.let { sets.add("session_name = ?"); params.add(it) }
             req.graphId?.let { sets.add("graph_id = ?::uuid"); params.add(it) }
             req.modelName?.let { sets.add("model_name = ?"); params.add(it) }
+            req.transcript?.let { sets.add("transcript = ?"); params.add(it) }
 
             if (sets.isEmpty()) return HttpStatusCode.BadRequest.description("Nothing to update")
 
@@ -275,7 +281,8 @@ object AgentOps {
             val toolName: String? = null,
             val toolCallArgs: String? = null,   // JSON string
             val toolResult: String? = null,
-            val tokenCount: Int? = null
+            val tokenCount: Int? = null,
+            val inputTokenCount: Int? = null
         )
 
         data class Request(
@@ -307,8 +314,8 @@ object AgentOps {
 
                 val insertSql = """
                     INSERT INTO agent_messages
-                    (session_id, message_index, role, content, tool_call_id, tool_name, tool_call_args, tool_result, token_count)
-                    VALUES (?::uuid, ?, ?, ?, ?, ?, ?::jsonb, ?, ?)
+                    (session_id, message_index, role, content, tool_call_id, tool_name, tool_call_args, tool_result, token_count, input_token_count)
+                    VALUES (?::uuid, ?, ?, ?, ?, ?, ?::jsonb, ?, ?, ?)
                     RETURNING message_id
                 """.trimIndent()
 
@@ -323,6 +330,7 @@ object AgentOps {
                         setJsonb(ps, 7, msg.toolCallArgs)
                         ps.setString(8, msg.toolResult)
                         if (msg.tokenCount != null) ps.setInt(9, msg.tokenCount) else ps.setNull(9, java.sql.Types.INTEGER)
+                        if (msg.inputTokenCount != null) ps.setInt(10, msg.inputTokenCount) else ps.setNull(10, java.sql.Types.INTEGER)
                         ps.addBatch()
                     }
                     // Execute batch and collect generated keys
@@ -364,7 +372,7 @@ object AgentOps {
             fa.session.useDb { conn ->
                 conn.prepareStatement(
                     "SELECT message_id, message_index, role, content, tool_call_id, tool_name, " +
-                    "tool_call_args, tool_result, token_count, created_at " +
+                    "tool_call_args, tool_result, token_count, input_token_count, created_at " +
                     "FROM agent_messages WHERE session_id = ?::uuid AND message_index >= ? " +
                     "ORDER BY message_index ASC LIMIT ?"
                 ).use { ps ->
@@ -383,6 +391,7 @@ object AgentOps {
                             "toolCallArgs" to rs.getJsonb("tool_call_args"),
                             "toolResult" to rs.getString("tool_result"),
                             "tokenCount" to rs.getObject("token_count"),
+                            "inputTokenCount" to rs.getObject("input_token_count"),
                             "createdAt" to rs.getString("created_at")
                         ))
                     }
@@ -1121,9 +1130,17 @@ object AgentOps {
             val sessionId: String,
             val messageId: Long? = null,
             val nodeId: String? = null,
+            val toolCallId: String? = null,
             val toolName: String,
             val toolArgs: String? = null,        // JSON string
+            val resultUuid: String? = null,
             val resultSummary: String? = null,
+            val resultContent: String? = null,
+            val resultOriginalBytes: Int? = null,
+            val resultStoredBytes: Int? = null,
+            val resultTruncated: Boolean? = null,
+            val resultSha256: String? = null,
+            val storagePolicy: String? = null,
             val success: Boolean = true,
             val durationMs: Long? = null
         )
@@ -1132,29 +1149,236 @@ object AgentOps {
             val req = ctx.receive<Request>()
             val fa = try { fastAccess(ctx) } catch (e: FastAccessException) { return e.code }
 
+            val resultUuid = req.resultUuid?.takeIf { it.isNotBlank() } ?: UUID.randomUUID().toString()
             var callId: Long? = null
             fa.session.useDb { conn ->
                 conn.prepareStatement(
                     """
                     INSERT INTO agent_tool_calls
-                    (session_id, message_id, node_id, tool_name, tool_args, result_summary, success, duration_ms)
-                    VALUES (?::uuid, ?, ?, ?, ?::jsonb, ?, ?, ?)
+                    (session_id, message_id, node_id, tool_call_id, tool_name, tool_args, result_uuid,
+                     result_summary, result_original_bytes, result_stored_bytes, result_truncated,
+                     result_sha256, storage_policy, success, duration_ms)
+                    VALUES (?::uuid, ?, ?, ?, ?, ?::jsonb, ?::uuid, ?, ?, ?, ?, ?, ?, ?, ?)
                     RETURNING call_id
                     """.trimIndent()
                 ).use { ps ->
                     ps.setString(1, req.sessionId)
                     if (req.messageId != null) ps.setLong(2, req.messageId) else ps.setNull(2, java.sql.Types.BIGINT)
                     ps.setString(3, req.nodeId)
-                    ps.setString(4, req.toolName)
-                    setJsonb(ps, 5, req.toolArgs)
-                    ps.setString(6, req.resultSummary)
-                    ps.setBoolean(7, req.success)
-                    if (req.durationMs != null) ps.setLong(8, req.durationMs) else ps.setNull(8, java.sql.Types.BIGINT)
+                    ps.setString(4, req.toolCallId)
+                    ps.setString(5, req.toolName)
+                    setJsonb(ps, 6, req.toolArgs)
+                    ps.setString(7, resultUuid)
+                    ps.setString(8, req.resultSummary)
+                    if (req.resultOriginalBytes != null) ps.setInt(9, req.resultOriginalBytes) else ps.setNull(9, java.sql.Types.INTEGER)
+                    if (req.resultStoredBytes != null) ps.setInt(10, req.resultStoredBytes) else ps.setNull(10, java.sql.Types.INTEGER)
+                    if (req.resultTruncated != null) ps.setBoolean(11, req.resultTruncated) else ps.setNull(11, java.sql.Types.BOOLEAN)
+                    ps.setString(12, req.resultSha256)
+                    ps.setString(13, req.storagePolicy)
+                    ps.setBoolean(14, req.success)
+                    if (req.durationMs != null) ps.setLong(15, req.durationMs) else ps.setNull(15, java.sql.Types.BIGINT)
                     val rs = ps.executeQuery()
                     if (rs.next()) callId = rs.getLong("call_id")
                 }
+
+                if (req.resultContent != null && callId != null) {
+                    conn.prepareStatement(
+                        """
+                        INSERT INTO agent_tool_call_results
+                        (result_uuid, call_id, session_id, message_id, tool_call_id, tool_name, tool_args,
+                         content, original_bytes, stored_bytes, truncated, sha256, storage_policy)
+                        VALUES (?::uuid, ?, ?::uuid, ?, ?, ?, ?::jsonb, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT (result_uuid) DO NOTHING
+                        """.trimIndent()
+                    ).use { ps ->
+                        ps.setString(1, resultUuid)
+                        ps.setLong(2, callId)
+                        ps.setString(3, req.sessionId)
+                        if (req.messageId != null) ps.setLong(4, req.messageId) else ps.setNull(4, java.sql.Types.BIGINT)
+                        ps.setString(5, req.toolCallId)
+                        ps.setString(6, req.toolName)
+                        setJsonb(ps, 7, req.toolArgs)
+                        ps.setString(8, req.resultContent)
+                        ps.setInt(9, req.resultOriginalBytes ?: req.resultContent.toByteArray(Charsets.UTF_8).size)
+                        ps.setInt(10, req.resultStoredBytes ?: req.resultContent.toByteArray(Charsets.UTF_8).size)
+                        ps.setBoolean(11, req.resultTruncated ?: false)
+                        ps.setString(12, req.resultSha256)
+                        ps.setString(13, req.storagePolicy ?: "full")
+                        ps.executeUpdate()
+                    }
+                }
             }
             return callId ?: HttpStatusCode.InternalServerError.description("Failed to record tool call")
+        }
+    }
+
+    /** Find stored tool call results by session and optional fingerprints. */
+    object FindToolCallResults : AbstractPostRoute() {
+        override val path: String = "/agent/tool_call/result/find"
+
+        data class Request(
+            val sessionId: String,
+            val resultSha256: String? = null,
+            val toolName: String? = null,
+            val toolArgs: String? = null,
+            val limit: Int = 20
+        )
+
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val req = ctx.receive<Request>()
+            val fa = try { fastAccess(ctx) } catch (e: FastAccessException) { return e.code }
+            val safeLimit = req.limit.coerceIn(1, 100)
+            val results: MutableList<Map<String, Any?>> = mutableListOf()
+
+            fa.session.useDb { conn ->
+                val conditions = mutableListOf("session_id = ?::uuid")
+                if (!req.resultSha256.isNullOrBlank()) conditions.add("sha256 = ?")
+                if (!req.toolName.isNullOrBlank()) conditions.add("tool_name = ?")
+                if (!req.toolArgs.isNullOrBlank()) conditions.add("tool_args = ?::jsonb")
+
+                val sql = """
+                    SELECT result_uuid, call_id, session_id, message_id, tool_call_id, tool_name, tool_args,
+                           original_bytes, stored_bytes, truncated, sha256, storage_policy, created_at
+                    FROM agent_tool_call_results
+                    WHERE ${conditions.joinToString(" AND ")}
+                    ORDER BY created_at ASC
+                    LIMIT ?
+                """.trimIndent()
+
+                conn.prepareStatement(sql).use { ps ->
+                    var idx = 1
+                    ps.setString(idx++, req.sessionId)
+                    if (!req.resultSha256.isNullOrBlank()) ps.setString(idx++, req.resultSha256)
+                    if (!req.toolName.isNullOrBlank()) ps.setString(idx++, req.toolName)
+                    if (!req.toolArgs.isNullOrBlank()) setJsonb(ps, idx++, req.toolArgs)
+                    ps.setInt(idx, safeLimit)
+
+                    val rs = ps.executeQuery()
+                    while (rs.next()) {
+                        results.add(mapOf(
+                            "resultUuid" to rs.getString("result_uuid"),
+                            "callId" to rs.getLong("call_id"),
+                            "sessionId" to rs.getString("session_id"),
+                            "messageId" to rs.getObject("message_id"),
+                            "toolCallId" to rs.getString("tool_call_id"),
+                            "toolName" to rs.getString("tool_name"),
+                            "toolArgs" to rs.getJsonb("tool_args"),
+                            "originalBytes" to rs.getInt("original_bytes"),
+                            "storedBytes" to rs.getInt("stored_bytes"),
+                            "truncated" to rs.getBoolean("truncated"),
+                            "sha256" to rs.getString("sha256"),
+                            "storagePolicy" to rs.getString("storage_policy"),
+                            "createdAt" to rs.getString("created_at")
+                        ))
+                    }
+                }
+            }
+            return results
+        }
+    }
+
+    /** Retrieve a stored tool call result by UUID. */
+    object GetToolCallResult : AbstractPostRoute() {
+        override val path: String = "/agent/tool_call/result/get"
+
+        data class Request(
+            val resultUuid: String,
+            val offset: Int = 0,
+            val limit: Int = 8000,
+            val grep: String? = null,
+            val around: Int = 3
+        )
+
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val req = ctx.receive<Request>()
+            val fa = try { fastAccess(ctx) } catch (e: FastAccessException) { return e.code }
+            val safeLimit = req.limit.coerceIn(1, 8000)
+            val safeOffset = req.offset.coerceAtLeast(0)
+            var result: Map<String, Any?>? = null
+
+            fa.session.useDb { conn ->
+                conn.prepareStatement(
+                    """
+                    SELECT result_uuid, call_id, session_id, message_id, tool_call_id, tool_name, tool_args,
+                           content, original_bytes, stored_bytes, truncated, sha256, storage_policy, created_at
+                    FROM agent_tool_call_results
+                    WHERE result_uuid = ?::uuid
+                    """.trimIndent()
+                ).use { ps ->
+                    ps.setString(1, req.resultUuid)
+                    val rs = ps.executeQuery()
+                    if (rs.next()) {
+                        val content = rs.getString("content") ?: ""
+                        val slice = if (!req.grep.isNullOrBlank()) {
+                            grepSnippet(content, req.grep, req.around, safeLimit)
+                        } else {
+                            content.drop(safeOffset).take(safeLimit)
+                        }
+                        result = mapOf(
+                            "resultUuid" to rs.getString("result_uuid"),
+                            "callId" to rs.getLong("call_id"),
+                            "sessionId" to rs.getString("session_id"),
+                            "messageId" to rs.getObject("message_id"),
+                            "toolCallId" to rs.getString("tool_call_id"),
+                            "toolName" to rs.getString("tool_name"),
+                            "toolArgs" to rs.getJsonb("tool_args"),
+                            "content" to slice,
+                            "offset" to safeOffset,
+                            "returnedChars" to slice.length,
+                            "storedChars" to content.length,
+                            "originalBytes" to rs.getInt("original_bytes"),
+                            "storedBytes" to rs.getInt("stored_bytes"),
+                            "truncated" to rs.getBoolean("truncated"),
+                            "sha256" to rs.getString("sha256"),
+                            "storagePolicy" to rs.getString("storage_policy"),
+                            "createdAt" to rs.getString("created_at")
+                        )
+                    }
+                }
+            }
+            return result ?: HttpStatusCode.NotFound.description("Tool call result not found")
+        }
+
+        private fun grepSnippet(content: String, grep: String, around: Int, limit: Int): String {
+            val lines = content.lines()
+            val idx = lines.indexOfFirst { it.contains(grep, ignoreCase = true) }
+            if (idx < 0) return "No match for '$grep'."
+            val start = (idx - around.coerceAtLeast(0)).coerceAtLeast(0)
+            val end = (idx + around.coerceAtLeast(0) + 1).coerceAtMost(lines.size)
+            return lines.subList(start, end).joinToString("\n").take(limit)
+        }
+    }
+
+    // ============================================================
+    //  Transcript Append
+    // ============================================================
+
+    /** Append Markdown content to a session's transcript field. */
+    object AppendTranscript : AbstractPostRoute() {
+        override val path: String = "/agent/transcript/append"
+
+        data class Request(
+            val sessionId: String,
+            val content: String
+        )
+
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val req = ctx.receive<Request>()
+            val fa = try { fastAccess(ctx) } catch (e: FastAccessException) { return e.code }
+
+            var updated = 0
+            fa.session.useDb { conn ->
+                conn.prepareStatement(
+                    "UPDATE agent_sessions SET transcript = COALESCE(transcript, '') || ?, updated_at = now() " +
+                    "WHERE session_id = ?::uuid"
+                ).use { ps ->
+                    ps.setString(1, req.content)
+                    ps.setString(2, req.sessionId)
+                    updated = ps.executeUpdate()
+                }
+            }
+            return if (updated > 0) HttpStatusCode.OK.description("Content appended")
+                   else HttpStatusCode.NotFound.description("Session not found")
         }
     }
 }

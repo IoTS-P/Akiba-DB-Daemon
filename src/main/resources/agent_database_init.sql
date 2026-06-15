@@ -29,11 +29,15 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
     module_name     TEXT,                          -- the AkibaModule that owns this session
     graph_id        UUID,                          -- FK → agent_graphs (set after graph is bound)
     model_name      TEXT,                          -- e.g. "gpt-4o", "claude-3-sonnet"
+    project_name    TEXT,                          -- Ghidra project bound to this interactive/automated session
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     resumed_at      TIMESTAMPTZ,                   -- last time the session was resumed from suspension
-    completed_at    TIMESTAMPTZ                    -- time the session reached terminal state
+    completed_at    TIMESTAMPTZ,                   -- time the session reached terminal state
+    transcript      TEXT                           -- Markdown rendering of the full session transcript
 );
+
+ALTER TABLE agent_sessions ADD COLUMN IF NOT EXISTS project_name TEXT;
 
 SELECT assert_column_type('public', 'agent_sessions', 'session_id',    'uuid');
 SELECT assert_column_type('public', 'agent_sessions', 'session_name',  'text');
@@ -42,10 +46,12 @@ SELECT assert_column_type('public', 'agent_sessions', 'binary_id',     'int4');
 SELECT assert_column_type('public', 'agent_sessions', 'module_name',   'text');
 SELECT assert_column_type('public', 'agent_sessions', 'graph_id',      'uuid');
 SELECT assert_column_type('public', 'agent_sessions', 'model_name',    'text');
+SELECT assert_column_type('public', 'agent_sessions', 'project_name',  'text');
 SELECT assert_column_type('public', 'agent_sessions', 'created_at',    'timestamptz');
 SELECT assert_column_type('public', 'agent_sessions', 'updated_at',    'timestamptz');
 SELECT assert_column_type('public', 'agent_sessions', 'resumed_at',    'timestamptz');
 SELECT assert_column_type('public', 'agent_sessions', 'completed_at',  'timestamptz');
+SELECT assert_column_type('public', 'agent_sessions', 'transcript',    'text');
 
 CREATE INDEX IF NOT EXISTS idx_agent_sessions_status    ON agent_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_agent_sessions_binary_id ON agent_sessions(binary_id);
@@ -67,8 +73,9 @@ CREATE TABLE IF NOT EXISTS agent_messages (
     tool_call_id    TEXT,                          -- correlates a tool response to its call
     tool_name       TEXT,                          -- the name of the tool that was invoked
     tool_call_args  JSONB,                         -- arguments passed to the tool (JSON)
-    tool_result     TEXT,                          -- text result returned by the tool
-    token_count     INTEGER,                       -- optional token usage for this message
+    tool_result      TEXT,                          -- text result returned by the tool
+    token_count     INTEGER,                       -- optional output token usage for this message
+    input_token_count INTEGER,                      -- optional input token usage for the LLM call that produced this message
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -82,6 +89,7 @@ SELECT assert_column_type('public', 'agent_messages', 'tool_name',      'text');
 SELECT assert_column_type('public', 'agent_messages', 'tool_call_args', 'jsonb');
 SELECT assert_column_type('public', 'agent_messages', 'tool_result',    'text');
 SELECT assert_column_type('public', 'agent_messages', 'token_count',    'int4');
+SELECT assert_column_type('public', 'agent_messages', 'input_token_count', 'int4');
 SELECT assert_column_type('public', 'agent_messages', 'created_at',     'timestamptz');
 
 CREATE INDEX IF NOT EXISTS idx_agent_messages_session ON agent_messages(session_id, message_index);
@@ -136,26 +144,88 @@ CREATE TABLE IF NOT EXISTS agent_tool_calls (
     message_id      BIGINT REFERENCES agent_messages(message_id)
                         ON DELETE SET NULL ON UPDATE CASCADE,
     node_id         TEXT,                          -- which graph node issued this call
+    tool_call_id    TEXT,                          -- provider/framework tool-call id
     tool_name       TEXT NOT NULL,
     tool_args       JSONB,                         -- arguments as JSON
+    result_uuid     UUID,                          -- FK-like pointer to agent_tool_call_results.result_uuid
     result_summary  TEXT,                          -- truncated result for audit
+    result_original_bytes INTEGER,
+    result_stored_bytes INTEGER,
+    result_truncated BOOLEAN,
+    result_sha256   TEXT,
+    storage_policy  TEXT,
     success         BOOLEAN NOT NULL DEFAULT true,
     duration_ms     BIGINT,                        -- wall-clock duration in milliseconds
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS tool_call_id TEXT;
+ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS result_uuid UUID;
+ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS result_original_bytes INTEGER;
+ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS result_stored_bytes INTEGER;
+ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS result_truncated BOOLEAN;
+ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS result_sha256 TEXT;
+ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS storage_policy TEXT;
+
 SELECT assert_column_type('public', 'agent_tool_calls', 'call_id',        'int8');
 SELECT assert_column_type('public', 'agent_tool_calls', 'session_id',     'uuid');
 SELECT assert_column_type('public', 'agent_tool_calls', 'message_id',     'int8');
 SELECT assert_column_type('public', 'agent_tool_calls', 'node_id',        'text');
+SELECT assert_column_type('public', 'agent_tool_calls', 'tool_call_id',   'text');
 SELECT assert_column_type('public', 'agent_tool_calls', 'tool_name',      'text');
 SELECT assert_column_type('public', 'agent_tool_calls', 'tool_args',      'jsonb');
+SELECT assert_column_type('public', 'agent_tool_calls', 'result_uuid',    'uuid');
 SELECT assert_column_type('public', 'agent_tool_calls', 'result_summary', 'text');
+SELECT assert_column_type('public', 'agent_tool_calls', 'result_original_bytes', 'int4');
+SELECT assert_column_type('public', 'agent_tool_calls', 'result_stored_bytes', 'int4');
+SELECT assert_column_type('public', 'agent_tool_calls', 'result_truncated', 'bool');
+SELECT assert_column_type('public', 'agent_tool_calls', 'result_sha256',   'text');
+SELECT assert_column_type('public', 'agent_tool_calls', 'storage_policy',  'text');
 SELECT assert_column_type('public', 'agent_tool_calls', 'success',        'bool');
 SELECT assert_column_type('public', 'agent_tool_calls', 'duration_ms',    'int8');
 SELECT assert_column_type('public', 'agent_tool_calls', 'created_at',     'timestamptz');
 
 CREATE INDEX IF NOT EXISTS idx_agent_tool_calls_session ON agent_tool_calls(session_id);
+CREATE INDEX IF NOT EXISTS idx_agent_tool_calls_result_uuid ON agent_tool_calls(result_uuid);
+
+CREATE TABLE IF NOT EXISTS agent_tool_call_results (
+    result_uuid    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    call_id        BIGINT REFERENCES agent_tool_calls(call_id)
+                       ON DELETE CASCADE ON UPDATE CASCADE,
+    session_id     UUID NOT NULL REFERENCES agent_sessions(session_id)
+                       ON DELETE CASCADE ON UPDATE CASCADE,
+    message_id     BIGINT REFERENCES agent_messages(message_id)
+                       ON DELETE SET NULL ON UPDATE CASCADE,
+    tool_call_id   TEXT,
+    tool_name      TEXT NOT NULL,
+    tool_args      JSONB,
+    content        TEXT NOT NULL,
+    original_bytes INTEGER NOT NULL,
+    stored_bytes   INTEGER NOT NULL,
+    truncated      BOOLEAN NOT NULL DEFAULT false,
+    sha256         TEXT,
+    storage_policy TEXT NOT NULL DEFAULT 'full',
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+SELECT assert_column_type('public', 'agent_tool_call_results', 'result_uuid',    'uuid');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'call_id',        'int8');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'session_id',     'uuid');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'message_id',     'int8');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'tool_call_id',   'text');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'tool_name',      'text');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'tool_args',      'jsonb');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'content',        'text');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'original_bytes', 'int4');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'stored_bytes',   'int4');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'truncated',      'bool');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'sha256',         'text');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'storage_policy', 'text');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'created_at',     'timestamptz');
+
+CREATE INDEX IF NOT EXISTS idx_agent_tool_call_results_session ON agent_tool_call_results(session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_agent_tool_call_results_session_sha ON agent_tool_call_results(session_id, sha256);
+CREATE INDEX IF NOT EXISTS idx_agent_tool_call_results_call_id ON agent_tool_call_results(call_id);
 
 -- ----------------------------------------------------------
 -- 5. agent_session_contexts
