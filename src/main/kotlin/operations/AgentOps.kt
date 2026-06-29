@@ -44,6 +44,28 @@ object AgentOps {
     private fun ResultSet.getUUIDStr(columnLabel: String): String? =
         getString(columnLabel)
 
+    private val runtimeStates = setOf("running", "standby", "msghandle", "cancelling", "closed", "error")
+
+    /** Normalize legacy UI statuses onto the runtime_state enum. */
+    private fun normalizeRuntimeState(raw: String?): String? = when (raw?.lowercase()) {
+        null -> null
+        "running" -> "running"
+        "active" -> "running"
+        "standby" -> "standby"
+        "suspended" -> "standby"
+        "msghandle" -> "msghandle"
+        "cancelling" -> "cancelling"
+        "closed" -> "closed"
+        "completed" -> "closed"
+        "cancelled" -> "closed"
+        "error" -> "error"
+        "failed" -> "error"
+        else -> null
+    }
+
+    private fun ResultSet.sessionRuntimeState(): String =
+        getString("runtime_state") ?: normalizeRuntimeState(getString("status")) ?: "running"
+
     // ============================================================
     //  Session CRUD
     // ============================================================
@@ -57,19 +79,44 @@ object AgentOps {
             val binaryId: Int? = null,
             val moduleName: String? = null,
             val modelName: String? = null,
-            val projectName: String? = null
+            val projectName: String? = null,
+            /**
+             * Optional UUID of the parent session. Used by `spawn_sub_agent`
+             * to attach the spawned child to the parent's tree.
+             */
+            val parentSessionId: String? = null
         )
 
         override suspend fun handle(ctx: RouteContext): Any? {
             val req = ctx.receive<Request>()
             val fa = try { fastAccess(ctx) } catch (e: FastAccessException) { return e.code }
 
+            // Validate that the requested parent actually exists (if specified).
+            // We allow null (top-level session).
+            if (req.parentSessionId != null) {
+                var parentExists = false
+                fa.session.useDb { conn ->
+                    conn.prepareStatement(
+                        "SELECT 1 FROM agent_sessions WHERE session_id = ?::uuid"
+                    ).use { ps ->
+                        ps.setString(1, req.parentSessionId)
+                        val rs = ps.executeQuery()
+                        if (rs.next()) parentExists = true
+                    }
+                }
+                if (!parentExists)
+                    return HttpStatusCode.BadRequest.description(
+                        "Parent session '${req.parentSessionId}' does not exist"
+                    )
+            }
+
             var sessionId: String? = null
             fa.session.useDb { conn ->
                 conn.prepareStatement(
                     """
-                    INSERT INTO agent_sessions (session_name, binary_id, module_name, model_name, project_name)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO agent_sessions
+                        (session_name, binary_id, module_name, model_name, project_name, parent_session_id)
+                    VALUES (?, ?, ?, ?, ?, ?::uuid)
                     RETURNING session_id
                     """.trimIndent()
                 ).use { ps ->
@@ -78,6 +125,8 @@ object AgentOps {
                     ps.setString(3, req.moduleName)
                     ps.setString(4, req.modelName)
                     ps.setString(5, req.projectName)
+                    if (req.parentSessionId != null) ps.setString(6, req.parentSessionId)
+                    else ps.setNull(6, java.sql.Types.OTHER)
                     val rs = ps.executeQuery()
                     if (rs.next()) sessionId = rs.getUUIDStr("session_id")
                 }
@@ -99,7 +148,8 @@ object AgentOps {
             fa.session.useDb { conn ->
                 conn.prepareStatement(
                     "SELECT session_id, session_name, status, binary_id, module_name, graph_id, " +
-                    "model_name, project_name, created_at, updated_at, resumed_at, completed_at, transcript " +
+                    "model_name, project_name, created_at, updated_at, resumed_at, completed_at, transcript, " +
+                    "parent_session_id, lifecycle, runtime_state, closing_reason " +
                     "FROM agent_sessions WHERE session_id = ?::uuid"
                 ).use { ps ->
                     ps.setString(1, sessionId)
@@ -108,7 +158,7 @@ object AgentOps {
                         result = mapOf(
                             "sessionId" to rs.getUUIDStr("session_id"),
                             "sessionName" to rs.getString("session_name"),
-                            "status" to rs.getString("status"),
+                            "status" to rs.sessionRuntimeState(),
                             "binaryId" to rs.getObject("binary_id"),
                             "moduleName" to rs.getString("module_name"),
                             "graphId" to rs.getUUIDStr("graph_id"),
@@ -117,12 +167,63 @@ object AgentOps {
                             "updatedAt" to rs.getString("updated_at"),
                             "resumedAt" to rs.getString("resumed_at"),
                             "completedAt" to rs.getString("completed_at"),
-                            "transcript" to rs.getString("transcript")
+                            "transcript" to rs.getString("transcript"),
+                            "parentSessionId" to rs.getUUIDStr("parent_session_id"),
+                            "lifecycle" to rs.getString("lifecycle"),
+                            "runtimeState" to rs.getString("runtime_state"),
+                            "closingReason" to rs.getString("closing_reason"),
                         )
                     }
                 }
             }
             return result ?: HttpStatusCode.NotFound.description("Session not found")
+        }
+    }
+
+    /**
+     * List direct children of a parent session. Used by the frontend to
+     * walk the parent → child tree for a multi-agent session.
+     */
+    object GetSessionChildren : AbstractPostRoute() {
+        override val path: String = "/agent/session/children"
+
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val body = ctx.receive<Map<String, String>>()
+            val parentId = body["parentSessionId"]
+                ?: return HttpStatusCode.BadRequest.description("parentSessionId is required")
+            val fa = try { fastAccess(ctx) } catch (e: FastAccessException) { return e.code }
+
+            val results: MutableList<Map<String, Any?>> = mutableListOf()
+            fa.session.useDb { conn ->
+                val sql = """
+                    SELECT session_id, session_name, status, runtime_state, binary_id, module_name,
+                           model_name, project_name, created_at, updated_at, parent_session_id
+                    FROM agent_sessions
+                    WHERE parent_session_id = ?::uuid
+                    ORDER BY created_at ASC
+                """.trimIndent()
+                conn.prepareStatement(sql).use { ps ->
+                    ps.setString(1, parentId)
+                    val rs = ps.executeQuery()
+                    while (rs.next()) {
+                        val runtimeState = rs.sessionRuntimeState()
+                        results.add(mapOf(
+                            "sessionId" to rs.getUUIDStr("session_id"),
+                            "sessionName" to rs.getString("session_name"),
+                            "status" to runtimeState,
+                            "runtimeState" to runtimeState,
+                            "binaryId" to rs.getObject("binary_id"),
+                            "moduleName" to rs.getString("module_name"),
+                            "modelName" to rs.getString("model_name"),
+                            "projectName" to rs.getString("project_name"),
+                            "createdAt" to rs.getString("created_at"),
+                            "updatedAt" to rs.getString("updated_at"),
+                            "parentSessionId" to rs.getUUIDStr("parent_session_id")
+                        ))
+                    }
+                }
+            }
+            return results
         }
     }
 
@@ -135,12 +236,30 @@ object AgentOps {
             val binaryId: Int? = null,
             val moduleName: String? = null,
             val limit: Int = 50,
-            val offset: Int = 0
+            val offset: Int = 0,
+            /**
+             * Filter by parent_session_id.
+             *   - `null` (default): only top-level sessions (parent_session_id IS NULL)
+             *   - a specific UUID: only direct children of that parent
+             *   - the literal string "ALL" (or any non-UUID string): return every session
+             *     regardless of parent (used by advanced views)
+             */
+            val parentSessionId: String? = null
         )
 
         override suspend fun handle(ctx: RouteContext): Any? {
             val req = ctx.receive<Request>()
             val fa = try { fastAccess(ctx) } catch (e: FastAccessException) { return e.code }
+
+            // Normalize the status filter up-front so we can return
+            // a clean 400 before opening the DB connection (and
+            // without escaping from `useDb`'s non-inline lambda).
+            val normalizedStatus: String? = req.status?.let { raw ->
+                normalizeRuntimeState(raw)
+                    ?: return HttpStatusCode.BadRequest.description(
+                        "Invalid status: $raw. Must be one of $runtimeStates"
+                    )
+            }
 
             val results: MutableList<Map<String, Any?>> = mutableListOf()
             fa.session.useDb { conn ->
@@ -149,9 +268,9 @@ object AgentOps {
                 val params = mutableListOf<Any?>()
                 var paramIdx = 1
 
-                req.status?.let {
-                    conditions.add("status = ?")
-                    params.add(it)
+                if (normalizedStatus != null) {
+                    conditions.add("runtime_state = ?")
+                    params.add(normalizedStatus)
                 }
                 req.binaryId?.let {
                     conditions.add("binary_id = ?")
@@ -161,10 +280,24 @@ object AgentOps {
                     conditions.add("module_name = ?")
                     params.add(it)
                 }
+                when (val pid = req.parentSessionId) {
+                    null -> {
+                        // Default: only top-level sessions
+                        conditions.add("parent_session_id IS NULL")
+                    }
+                    "ALL" -> {
+                        // Explicit opt-in: return every session
+                    }
+                    else -> {
+                        conditions.add("parent_session_id = ?::uuid")
+                        params.add(pid)
+                    }
+                }
 
                 val where = if (conditions.isEmpty()) "" else "WHERE ${conditions.joinToString(" AND ")}"
-                val sql = "SELECT session_id, session_name, status, binary_id, module_name, " +
-                    "model_name, project_name, created_at, updated_at FROM agent_sessions $where " +
+                val sql = "SELECT session_id, session_name, status, runtime_state, binary_id, module_name, " +
+                    "model_name, project_name, created_at, updated_at, parent_session_id " +
+                    "FROM agent_sessions $where " +
                     "ORDER BY updated_at DESC LIMIT ? OFFSET ?"
 
                 conn.prepareStatement(sql).use { ps ->
@@ -182,16 +315,19 @@ object AgentOps {
 
                     val rs = ps.executeQuery()
                     while (rs.next()) {
+                        val runtimeState = rs.sessionRuntimeState()
                         results.add(mapOf(
                             "sessionId" to rs.getUUIDStr("session_id"),
                             "sessionName" to rs.getString("session_name"),
-                            "status" to rs.getString("status"),
+                            "status" to runtimeState,
+                            "runtimeState" to runtimeState,
                             "binaryId" to rs.getObject("binary_id"),
                             "moduleName" to rs.getString("module_name"),
                             "modelName" to rs.getString("model_name"),
                             "projectName" to rs.getString("project_name"),
                             "createdAt" to rs.getString("created_at"),
-                            "updatedAt" to rs.getString("updated_at")
+                            "updatedAt" to rs.getString("updated_at"),
+                            "parentSessionId" to rs.getUUIDStr("parent_session_id")
                         ))
                     }
                 }
@@ -217,10 +353,11 @@ object AgentOps {
             val req = ctx.receive<Request>()
             val fa = try { fastAccess(ctx) } catch (e: FastAccessException) { return e.code }
 
-            val validStatuses = setOf("active", "suspended", "completed", "error")
             req.status?.let {
-                if (it !in validStatuses)
-                    return HttpStatusCode.BadRequest.description("Invalid status: $it. Must be one of $validStatuses")
+                if (it !in runtimeStates)
+                    return HttpStatusCode.BadRequest.description(
+                        "Invalid status: $it. Must be one of $runtimeStates"
+                    )
             }
 
             val sets = mutableListOf<String>()
@@ -234,11 +371,14 @@ object AgentOps {
 
             if (sets.isEmpty()) return HttpStatusCode.BadRequest.description("Nothing to update")
 
-            // Auto-set timestamps based on status transitions
+            // Auto-set timestamps based on runtime_state transitions.
+            // The new enum mirrors runtime_state; `closed` and `error`
+            // are terminal and stamp completed_at, `standby` clears
+            // resumed_at (it represents a fresh park).
             req.status?.let { status ->
                 when (status) {
-                    "suspended" -> sets.add("resumed_at = NULL")
-                    "completed", "error" -> sets.add("completed_at = now()")
+                    "standby" -> sets.add("resumed_at = NULL")
+                    "closed", "error" -> sets.add("completed_at = now()")
                 }
             }
             sets.add("updated_at = now()")
@@ -263,6 +403,505 @@ object AgentOps {
             }
             return if (updated > 0) HttpStatusCode.OK.description("Session updated")
                    else HttpStatusCode.NotFound.description("Session not found")
+        }
+    }
+
+    /**
+     * Set the session's `lifecycle`. The framework sets this once at
+     * agent creation; downstream transitions stay out of this route
+     * so the orchestrator remains the single source of truth for the
+     * session state machine.
+     */
+    object SetSessionLifecycle : AbstractPostRoute() {
+        override val path: String = "/agent/session/set_lifecycle"
+
+        data class Request(
+            val sessionId: String,
+            val lifecycle: String,                  // one_shot | standby
+        )
+
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val req = ctx.receive<Request>()
+            val fa = try { fastAccess(ctx) } catch (e: FastAccessException) { return e.code }
+
+            if (req.lifecycle !in setOf("one_shot", "standby"))
+                return HttpStatusCode.BadRequest.description(
+                    "Invalid lifecycle: ${req.lifecycle}. Must be one_shot or standby"
+                )
+
+            var updated = 0
+            fa.session.useDb { conn ->
+                conn.prepareStatement(
+                    "UPDATE agent_sessions SET lifecycle = ?::text, updated_at = now() " +
+                        "WHERE session_id = ?::uuid"
+                ).use { ps ->
+                    ps.setString(1, req.lifecycle)
+                    ps.setString(2, req.sessionId)
+                    updated = ps.executeUpdate()
+                }
+            }
+            return if (updated > 0) HttpStatusCode.OK.description("Lifecycle set to ${req.lifecycle}")
+                   else HttpStatusCode.NotFound.description("Session not found")
+        }
+    }
+
+    /**
+     * Update the session's `runtime_state` and optional
+     * `closing_reason`. The route performs no transition validation —
+     * the framework's [org.iotsplab.akiba.llm.agent.RuntimeState] is
+     * the source of truth for legal transitions; this route just
+     * mirrors them. The schema CHECK constraint rejects unknown
+     * values, so a typo at the call site fails loud.
+     *
+     * When [closingReason] is non-null and [runtimeState] is
+     * `closed`, the daemon also stamps `completed_at = now()` so
+     * finished sessions are queryable by their end timestamp.
+     */
+    object SetRuntimeState : AbstractPostRoute() {
+        override val path: String = "/agent/session/set_runtime_state"
+
+        data class Request(
+            val sessionId: String,
+            val runtimeState: String,             // running | standby | msghandle | cancelling | closed | error
+            val closingReason: String? = null,
+        )
+
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val req = ctx.receive<Request>()
+            val fa = try { fastAccess(ctx) } catch (e: FastAccessException) { return e.code }
+
+            val validStates = setOf("running", "standby", "msghandle", "cancelling", "closed", "error")
+            if (req.runtimeState !in validStates)
+                return HttpStatusCode.BadRequest.description(
+                    "Invalid runtimeState: ${req.runtimeState}. Must be one of $validStates"
+                )
+
+            var updated = 0
+            fa.session.useDb { conn ->
+                val sets = mutableListOf("runtime_state = ?::text", "updated_at = now()")
+                val params = mutableListOf<Any?>(req.runtimeState)
+                if (req.closingReason != null) {
+                    sets.add("closing_reason = ?")
+                    params.add(req.closingReason)
+                }
+                if (req.runtimeState == "closed") {
+                    sets.add("completed_at = COALESCE(completed_at, now())")
+                }
+                params.add(req.sessionId)
+                val sql = "UPDATE agent_sessions SET ${sets.joinToString(", ")} " +
+                    "WHERE session_id = ?::uuid"
+                conn.prepareStatement(sql).use { ps ->
+                    var idx = 1
+                    for (v in params) {
+                        when (v) {
+                            is String -> ps.setString(idx, v)
+                            else -> ps.setObject(idx, v)
+                        }
+                        idx++
+                    }
+                    updated = ps.executeUpdate()
+                }
+            }
+            return if (updated > 0) HttpStatusCode.OK.description(
+                "Runtime state set to ${req.runtimeState}" +
+                    if (req.closingReason != null) " (reason=${req.closingReason})" else ""
+            ) else HttpStatusCode.NotFound.description("Session not found")
+        }
+    }
+
+    /**
+     * Fetch the session's current `runtime_state` and
+     * `closing_reason`. Cheap query used by the dispatcher
+     * pre-flight and by [org.iotsplab.akiba.llm.agent.JobHandle.await]
+     * to resolve the initial state without joining the framework's
+     * in-process cache.
+     */
+    object GetRuntimeState : AbstractPostRoute() {
+        override val path: String = "/agent/session/get_runtime_state"
+
+        data class Request(val sessionId: String)
+
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val req = ctx.receive<Request>()
+            val fa = try { fastAccess(ctx) } catch (e: FastAccessException) { return e.code }
+
+            var row: Map<String, Any?>? = null
+            fa.session.useDb { conn ->
+                conn.prepareStatement(
+                    "SELECT session_id, runtime_state, closing_reason, lifecycle, status " +
+                        "FROM agent_sessions WHERE session_id = ?::uuid"
+                ).use { ps ->
+                    ps.setString(1, req.sessionId)
+                    val rs = ps.executeQuery()
+                    if (rs.next()) {
+                        val runtimeState = rs.sessionRuntimeState()
+                        row = mapOf(
+                            "sessionId" to rs.getUUIDStr("session_id"),
+                            "runtimeState" to runtimeState,
+                            "closingReason" to rs.getString("closing_reason"),
+                            "lifecycle" to rs.getString("lifecycle"),
+                            "status" to runtimeState,
+                        )
+                    }
+                }
+            }
+            return row ?: HttpStatusCode.NotFound.description("Session not found")
+        }
+    }
+
+    /**
+     * List all non-closed descendants of a root session. Used by the
+     * cascade cancel walker and the OrphanReaper. One SQL round-trip
+     * — recursion is emulated in SQL via a recursive CTE so the
+     * daemon can answer the question without a Kotlin-side BFS.
+     */
+    object ListLiveSubtree : AbstractPostRoute() {
+        override val path: String = "/agent/session/list_live_subtree"
+
+        data class Request(
+            val rootSessionId: String,
+            val includeClosed: Boolean = false,
+        )
+
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val req = ctx.receive<Request>()
+            val fa = try { fastAccess(ctx) } catch (e: FastAccessException) { return e.code }
+
+            val results: MutableList<Map<String, Any?>> = mutableListOf()
+            fa.session.useDb { conn ->
+                val filter = if (req.includeClosed) "" else "AND runtime_state <> 'closed'"
+                val sql = """
+                    WITH RECURSIVE subtree AS (
+                        SELECT session_id, parent_session_id, runtime_state, closing_reason,
+                               lifecycle, status
+                        FROM agent_sessions
+                        WHERE session_id = ?::uuid
+                        UNION ALL
+                        SELECT s.session_id, s.parent_session_id, s.runtime_state, s.closing_reason,
+                               s.lifecycle, s.status
+                        FROM agent_sessions s
+                        JOIN subtree st ON s.parent_session_id = st.session_id
+                        WHERE s.session_id <> st.session_id
+                    )
+                    SELECT session_id, parent_session_id, runtime_state, closing_reason,
+                           lifecycle, status
+                    FROM subtree
+                    WHERE 1=1 $filter
+                    ORDER BY session_id
+                """.trimIndent()
+                conn.prepareStatement(sql).use { ps ->
+                    ps.setString(1, req.rootSessionId)
+                    val rs = ps.executeQuery()
+                    while (rs.next()) {
+                        val runtimeState = rs.sessionRuntimeState()
+                        results.add(mapOf(
+                            "sessionId" to rs.getUUIDStr("session_id"),
+                            "parentSessionId" to rs.getUUIDStr("parent_session_id"),
+                            "runtimeState" to runtimeState,
+                            "closingReason" to rs.getString("closing_reason"),
+                            "lifecycle" to rs.getString("lifecycle"),
+                            "status" to runtimeState,
+                        ))
+                    }
+                }
+            }
+            return results
+        }
+    }
+
+    // ============================================================
+    //  Agent status snapshot (used by get_agent_status tool)
+    // ============================================================
+    //
+    // One-row snapshot of a single target session's runtime state
+    // plus the aggregated counters the calling LLM needs to
+    // reason about itself (e.g. "am I a standby agent that
+    // should emit the `Enter standby mode.` marker?") or a
+    // child (e.g. "is this standby child still running?"):
+    //
+    //   * lastMessageAt        — the wall-clock time of the most
+    //                            recent row in agent_messages for
+    //                            that session (NULL when no
+    //                            messages yet).
+    //   * totalInputTokens     — sum of input_token_count over all
+    //                            assistant messages.  NULL/0 when
+    //                            the LLM provider did not report
+    //                            input tokens.
+    //   * totalOutputTokens    — sum of token_count over all
+    //                            assistant messages.
+    //   * totalToolCalls       — count of rows in agent_tool_calls
+    //                            for the session.
+    //   * childCount           — number of direct children
+    //                            (parent_session_id = target).
+    //   * runningChildCount    — subset of childCount whose
+    //                            runtime_state is 'running' or
+    //                            'msghandle'.
+    //
+    // ## Access policy (auto-detected)
+    //
+    // The caller does NOT pass a `scope` field.  The route
+    // reads the target's `parent_session_id` and the caller's
+    // `parent_session_id` and derives the relationship
+    // automatically:
+    //
+    //   * "self"          — target == caller
+    //   * "direct_child"  — target.parent == caller
+    //   * "direct_parent" — caller.parent == target
+    //   * "sibling"       — target.parent == caller.parent (and
+    //                       neither is null and target != caller)
+    //   * "other"         — anything else (grandchild, uncle,
+    //                       unrelated session, etc.)
+    //
+    // Currently only `self` and `direct_child` are admitted
+    // (the two cases the LLM legitimately needs: "look at my
+    // own state" and "look at my immediate child").  The other
+    // three are rejected with `status='forbidden'` and a hint
+    // so the LLM knows the relationship was detected but
+    // access is not granted yet.  Adding `direct_parent` /
+    // `sibling` access will require an explicit permission
+    // model and is intentionally deferred — keeping the deny
+    // path here is the safer default.
+    //
+    // childLimit is a hard cap (default 64, hard max 256) on
+    // the directChildren array.  When the cap is hit the
+    // response sets `directChildrenTruncated=true`.
+    object GetAgentStatus : AbstractPostRoute() {
+        override val path: String = "/agent/session/agent_status"
+
+        data class Request(
+            val callerSessionId: String,
+            val targetSessionId: String,
+            /** Hard cap on returned direct children. Default 64, max 256. */
+            val childLimit: Int = 64,
+        )
+
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val req = ctx.receive<Request>()
+            val fa = try { fastAccess(ctx) } catch (e: FastAccessException) { return e.code }
+
+            // ---- Validate input ---------------------------------------
+            if (req.callerSessionId.isBlank()) {
+                return HttpStatusCode.BadRequest.description("callerSessionId is required")
+            }
+            if (req.targetSessionId.isBlank()) {
+                return HttpStatusCode.BadRequest.description("targetSessionId is required")
+            }
+            val cap = req.childLimit.coerceIn(1, 256)
+
+            // ---- Load target + per-target counters --------------------
+            var snapshot: Map<String, Any?>? = null
+            var callerParent: String? = null
+            var callerExists: Boolean = req.callerSessionId == req.targetSessionId
+            fa.session.useDb { conn ->
+                // Two single-row reads: the target and the caller.
+                // We need the caller's parent_session_id to detect
+                // direct_parent and sibling relationships.  The
+                // target read pulls the same aggregated counters as
+                // before.
+                val targetSql = """
+                    SELECT
+                        s.session_id,
+                        s.session_name,
+                        s.runtime_state,
+                        s.lifecycle,
+                        s.parent_session_id,
+                        s.binary_id,
+                        s.module_name,
+                        s.model_name,
+                        s.closing_reason,
+                        s.created_at,
+                        s.updated_at,
+                        s.completed_at,
+                        (SELECT MAX(m.created_at)
+                           FROM agent_messages m
+                          WHERE m.session_id = s.session_id) AS last_message_at,
+                        COALESCE((SELECT SUM(m.input_token_count)
+                                    FROM agent_messages m
+                                   WHERE m.session_id = s.session_id
+                                     AND m.input_token_count IS NOT NULL), 0) AS total_input_tokens,
+                        COALESCE((SELECT SUM(m.token_count)
+                                    FROM agent_messages m
+                                   WHERE m.session_id = s.session_id
+                                     AND m.token_count IS NOT NULL), 0) AS total_output_tokens,
+                        (SELECT COUNT(*)
+                           FROM agent_tool_calls t
+                          WHERE t.session_id = s.session_id) AS total_tool_calls,
+                        (SELECT COUNT(*)
+                           FROM agent_sessions c
+                          WHERE c.parent_session_id = s.session_id) AS child_count,
+                        (SELECT COUNT(*)
+                           FROM agent_sessions c
+                          WHERE c.parent_session_id = s.session_id
+                            AND c.runtime_state IN ('running','msghandle')) AS running_child_count
+                    FROM agent_sessions s
+                    WHERE s.session_id = ?::uuid
+                """.trimIndent()
+                conn.prepareStatement(targetSql).use { ps ->
+                    ps.setString(1, req.targetSessionId)
+                    val rs = ps.executeQuery()
+                    if (rs.next()) {
+                        val runtimeState = rs.sessionRuntimeState()
+                        snapshot = mapOf(
+                            "sessionId" to rs.getUUIDStr("session_id"),
+                            "sessionName" to rs.getString("session_name"),
+                            "runtimeState" to runtimeState,
+                            "lifecycle" to rs.getString("lifecycle"),
+                            "parentSessionId" to rs.getUUIDStr("parent_session_id"),
+                            "binaryId" to rs.getObject("binary_id"),
+                            "moduleName" to rs.getString("module_name"),
+                            "modelName" to rs.getString("model_name"),
+                            "closingReason" to rs.getString("closing_reason"),
+                            "createdAt" to rs.getString("created_at"),
+                            "updatedAt" to rs.getString("updated_at"),
+                            "completedAt" to rs.getString("completed_at"),
+                            "lastMessageAt" to rs.getString("last_message_at"),
+                            "totalInputTokens" to (rs.getLong("total_input_tokens").takeIf { !rs.wasNull() } ?: 0L),
+                            "totalOutputTokens" to (rs.getLong("total_output_tokens").takeIf { !rs.wasNull() } ?: 0L),
+                            "totalToolCalls" to rs.getLong("total_tool_calls"),
+                            "childCount" to rs.getLong("child_count"),
+                            "runningChildCount" to rs.getLong("running_child_count"),
+                        )
+                    }
+                }
+                if (!callerExists) {
+                    conn.prepareStatement(
+                        "SELECT parent_session_id FROM agent_sessions " +
+                            "WHERE session_id = ?::uuid"
+                    ).use { ps ->
+                        ps.setString(1, req.callerSessionId)
+                        val rs = ps.executeQuery()
+                        if (rs.next()) {
+                            callerParent = rs.getString("parent_session_id")?.takeIf { it.isNotBlank() }
+                            callerExists = true
+                        }
+                    }
+                }
+            }
+            if (snapshot == null) {
+                return HttpStatusCode.NotFound.description(
+                    "Target session '${req.targetSessionId}' not found"
+                )
+            }
+            if (!callerExists) {
+                // Caller row not found is logged at warn level by
+                // the framework (the agent_session row is created
+                // before the agent starts); treat as 403 so the
+                // LLM gets a structured denial.
+                return mapOf(
+                    "status" to "forbidden",
+                    "error" to "callerSessionId '${req.callerSessionId}' not found",
+                    "callerSessionId" to req.callerSessionId,
+                    "targetSessionId" to req.targetSessionId,
+                    "relationship" to "other",
+                    "hint" to "The calling session is no longer registered. " +
+                        "This usually means the parent process restarted without " +
+                        "re-attaching to its child sessions.",
+                )
+            }
+            val targetParent = (snapshot["parentSessionId"] as String?)?.takeIf { it.isNotBlank() }
+
+            // ---- Auto-detect relationship ----------------------------
+            val relationship: String = when {
+                req.targetSessionId == req.callerSessionId -> "self"
+                targetParent != null && targetParent == req.callerSessionId -> "direct_child"
+                callerParent != null && callerParent == req.targetSessionId -> "direct_parent"
+                targetParent != null && targetParent == callerParent -> "sibling"
+                else -> "other"
+            }
+
+            // ---- Enforce access policy -------------------------------
+            // Default visibility: `self` and `direct_child` only.
+            // `direct_parent` / `sibling` / `other` are detected
+            // (so the LLM can see WHY access was denied) but
+            // currently rejected.  Future permission models can
+            // hook in here to admit additional relationships
+            // without changing the wire format.
+            val accessGranted: Boolean
+            val denyReason: String?
+            when (relationship) {
+                "self" -> {
+                    accessGranted = true
+                    denyReason = null
+                }
+                "direct_child" -> {
+                    accessGranted = true
+                    denyReason = null
+                }
+                else -> {
+                    accessGranted = false
+                    denyReason = when (relationship) {
+                        "direct_parent" ->
+                            "target is the direct parent of caller; viewing a parent " +
+                                "session's state is not yet permitted by the default policy"
+                        "sibling" ->
+                            "target is a sibling of caller (shares the same parent); " +
+                                "cross-sibling reads are not yet permitted by the default policy"
+                        else ->
+                            "target is neither the caller nor a direct child of caller; " +
+                                "the default policy only permits self / direct_child reads"
+                    }
+                }
+            }
+            if (!accessGranted) {
+                return mapOf(
+                    "status" to "forbidden",
+                    "error" to denyReason!!,
+                    "callerSessionId" to req.callerSessionId,
+                    "targetSessionId" to req.targetSessionId,
+                    "relationship" to relationship,
+                    "hint" to "Default visibility is 'self' and 'direct_child' only. " +
+                        "The relationship between caller and target was auto-detected " +
+                        "as '$relationship' and is currently not admitted. " +
+                        "Cross-relationship reads will be enabled after a future " +
+                        "permission model is added.",
+                )
+            }
+
+            // ---- Direct children of the target (capped) ---------------
+            val children = mutableListOf<Map<String, Any?>>()
+            var truncated = false
+            fa.session.useDb { conn ->
+                val sql = """
+                    SELECT session_id, session_name, runtime_state, lifecycle, parent_session_id,
+                           binary_id, module_name, model_name, created_at, updated_at
+                      FROM agent_sessions
+                     WHERE parent_session_id = ?::uuid
+                     ORDER BY created_at ASC
+                     LIMIT ?
+                """.trimIndent()
+                conn.prepareStatement(sql).use { ps ->
+                    ps.setString(1, req.targetSessionId)
+                    ps.setInt(2, cap + 1)  // +1 sentinel so we can detect truncation
+                    val rs = ps.executeQuery()
+                    var n = 0
+                    while (rs.next()) {
+                        n++
+                        if (n > cap) { truncated = true; break }
+                        val state = rs.sessionRuntimeState()
+                        children.add(mapOf(
+                            "sessionId" to rs.getUUIDStr("session_id"),
+                            "sessionName" to rs.getString("session_name"),
+                            "runtimeState" to state,
+                            "lifecycle" to rs.getString("lifecycle"),
+                            "parentSessionId" to rs.getUUIDStr("parent_session_id"),
+                            "binaryId" to rs.getObject("binary_id"),
+                            "moduleName" to rs.getString("module_name"),
+                            "modelName" to rs.getString("model_name"),
+                            "createdAt" to rs.getString("created_at"),
+                            "updatedAt" to rs.getString("updated_at"),
+                        ))
+                    }
+                }
+            }
+
+            return mapOf(
+                "status" to "ok",
+                "relationship" to relationship,
+                "callerSessionId" to req.callerSessionId,
+                "target" to snapshot,
+                "directChildren" to children,
+                "directChildrenTruncated" to truncated,
+            )
         }
     }
 

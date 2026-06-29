@@ -7,7 +7,7 @@
 -- storage, graph topology, and human-in-the-loop interaction.
 --
 -- Design principles:
---   • Idempotent (CREATE TABLE IF NOT EXISTS / ALTER TABLE … IF NOT EXISTS)
+--   • Idempotent (CREATE TABLE / INDEX IF NOT EXISTS)
 --   • Compatible with assert_column_type() defined in database_init.sql
 --   • Column/table names follow Akiba naming convention: ^[a-z][a-z0-9_]{0,62}$
 -- ============================================================
@@ -17,45 +17,96 @@
 --    The top-level session record.  One session represents a
 --    complete agent interaction lifecycle (from creation to
 --    completion or suspension).
+--
+--    lifecycle: policy that controls the agent's lifetime —
+--      one_shot (terminal after one task) or standby (parks
+--      after the first run and accepts mailbox messages).
+--
+--    runtime_state: current state in the async scheduler —
+--      running | standby | msghandle | cancelling | closed | error.
+--      Orthogonal to lifecycle; ERROR is a terminal state used
+--      when the agent run crashes (e.g. model service unavailable)
+--      so the parent can distinguish "completed cleanly" from
+--      "failed and needs recovery" without re-reading the transcript.
 -- ----------------------------------------------------------
 CREATE TABLE IF NOT EXISTS agent_sessions (
-    session_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    session_name    TEXT,                          -- optional human-readable label
-    status          TEXT NOT NULL DEFAULT 'active'  -- active | suspended | completed | error
-                        CHECK (status IN ('active','suspended','completed','error')),
-    binary_id       INTEGER REFERENCES binaries(id)
-                        ON DELETE SET NULL
-                        ON UPDATE CASCADE,         -- the binary being analyzed (nullable for non-binary sessions)
-    module_name     TEXT,                          -- the AkibaModule that owns this session
-    graph_id        UUID,                          -- FK → agent_graphs (set after graph is bound)
-    model_name      TEXT,                          -- e.g. "gpt-4o", "claude-3-sonnet"
-    project_name    TEXT,                          -- Ghidra project bound to this interactive/automated session
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    resumed_at      TIMESTAMPTZ,                   -- last time the session was resumed from suspension
-    completed_at    TIMESTAMPTZ,                   -- time the session reached terminal state
-    transcript      TEXT                           -- Markdown rendering of the full session transcript
+    session_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_name      TEXT,                          -- optional human-readable label
+    status            TEXT NOT NULL DEFAULT 'running' -- mirrors runtime_state for legacy clients
+                          CHECK (status IN ('running','standby','msghandle','cancelling','closed','error')),
+    binary_id         INTEGER REFERENCES binaries(id)
+                          ON DELETE SET NULL
+                          ON UPDATE CASCADE,         -- the binary being analyzed (nullable for non-binary sessions)
+    module_name       TEXT,                          -- the AkibaModule that owns this session
+    graph_id          UUID,                          -- FK → agent_graphs (set after graph is bound)
+    model_name        TEXT,                          -- e.g. "gpt-4o", "claude-3-sonnet"
+    project_name      TEXT,                          -- Ghidra project bound to this interactive/automated session
+    parent_session_id UUID                           -- self-reference; null for root sessions
+                          REFERENCES agent_sessions(session_id)
+                          ON DELETE SET NULL
+                          ON UPDATE CASCADE,
+    lifecycle         TEXT NOT NULL DEFAULT 'one_shot'
+                          CHECK (lifecycle IN ('one_shot', 'standby')),
+    runtime_state     TEXT NOT NULL DEFAULT 'running'
+                          CHECK (runtime_state IN (
+                              'running', 'standby', 'msghandle', 'cancelling', 'closed', 'error'
+                          )),
+    closing_reason    TEXT,                          -- human-readable cause for terminal transitions
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    resumed_at        TIMESTAMPTZ,                   -- last time the session was resumed from suspension
+    completed_at      TIMESTAMPTZ,                   -- time the session reached terminal state
+    transcript        TEXT                           -- Markdown rendering of the full session transcript
 );
 
-ALTER TABLE agent_sessions ADD COLUMN IF NOT EXISTS project_name TEXT;
+SELECT assert_column_type('public', 'agent_sessions', 'session_id',        'uuid');
+SELECT assert_column_type('public', 'agent_sessions', 'session_name',      'text');
+SELECT assert_column_type('public', 'agent_sessions', 'status',            'text');
+SELECT assert_column_type('public', 'agent_sessions', 'binary_id',         'int4');
+SELECT assert_column_type('public', 'agent_sessions', 'module_name',       'text');
+SELECT assert_column_type('public', 'agent_sessions', 'graph_id',          'uuid');
+SELECT assert_column_type('public', 'agent_sessions', 'model_name',        'text');
+SELECT assert_column_type('public', 'agent_sessions', 'project_name',      'text');
+SELECT assert_column_type('public', 'agent_sessions', 'parent_session_id', 'uuid');
+SELECT assert_column_type('public', 'agent_sessions', 'lifecycle',         'text');
+SELECT assert_column_type('public', 'agent_sessions', 'runtime_state',     'text');
+SELECT assert_column_type('public', 'agent_sessions', 'closing_reason',    'text');
+SELECT assert_column_type('public', 'agent_sessions', 'created_at',        'timestamptz');
+SELECT assert_column_type('public', 'agent_sessions', 'updated_at',        'timestamptz');
+SELECT assert_column_type('public', 'agent_sessions', 'resumed_at',        'timestamptz');
+SELECT assert_column_type('public', 'agent_sessions', 'completed_at',      'timestamptz');
+SELECT assert_column_type('public', 'agent_sessions', 'transcript',        'text');
 
-SELECT assert_column_type('public', 'agent_sessions', 'session_id',    'uuid');
-SELECT assert_column_type('public', 'agent_sessions', 'session_name',  'text');
-SELECT assert_column_type('public', 'agent_sessions', 'status',        'text');
-SELECT assert_column_type('public', 'agent_sessions', 'binary_id',     'int4');
-SELECT assert_column_type('public', 'agent_sessions', 'module_name',   'text');
-SELECT assert_column_type('public', 'agent_sessions', 'graph_id',      'uuid');
-SELECT assert_column_type('public', 'agent_sessions', 'model_name',    'text');
-SELECT assert_column_type('public', 'agent_sessions', 'project_name',  'text');
-SELECT assert_column_type('public', 'agent_sessions', 'created_at',    'timestamptz');
-SELECT assert_column_type('public', 'agent_sessions', 'updated_at',    'timestamptz');
-SELECT assert_column_type('public', 'agent_sessions', 'resumed_at',    'timestamptz');
-SELECT assert_column_type('public', 'agent_sessions', 'completed_at',  'timestamptz');
-SELECT assert_column_type('public', 'agent_sessions', 'transcript',    'text');
+-- Migrate older instances whose `status` column used the legacy
+-- active/suspended/completed/error vocabulary.  From this point on
+-- `status` mirrors `runtime_state`; `closing_reason` carries the
+-- difference between normal close and cancellation.
+ALTER TABLE agent_sessions ALTER COLUMN status SET DEFAULT 'running';
+ALTER TABLE agent_sessions DROP CONSTRAINT IF EXISTS agent_sessions_status_check;
+UPDATE agent_sessions
+SET status = CASE
+    WHEN runtime_state IN ('running','standby','msghandle','cancelling','closed','error') THEN runtime_state
+    WHEN status = 'active' THEN 'running'
+    WHEN status = 'suspended' THEN 'standby'
+    WHEN status = 'completed' THEN 'closed'
+    WHEN status = 'cancelled' THEN 'closed'
+    WHEN status = 'failed' THEN 'error'
+    ELSE 'running'
+END
+WHERE status NOT IN ('running','standby','msghandle','cancelling','closed','error')
+   OR status <> runtime_state;
+ALTER TABLE agent_sessions
+    ADD CONSTRAINT agent_sessions_status_check
+    CHECK (status IN ('running','standby','msghandle','cancelling','closed','error'));
 
-CREATE INDEX IF NOT EXISTS idx_agent_sessions_status    ON agent_sessions(status);
-CREATE INDEX IF NOT EXISTS idx_agent_sessions_binary_id ON agent_sessions(binary_id);
-CREATE INDEX IF NOT EXISTS idx_agent_sessions_module    ON agent_sessions(module_name);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_status            ON agent_sessions(status);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_binary_id         ON agent_sessions(binary_id);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_module            ON agent_sessions(module_name);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_parent_session    ON agent_sessions(parent_session_id);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_runtime_state     ON agent_sessions(runtime_state);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_parent_state       ON agent_sessions(parent_session_id, runtime_state);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_closing_reason     ON agent_sessions(closing_reason) WHERE closing_reason IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_lifecycle_status   ON agent_sessions(lifecycle, status);
 
 -- ----------------------------------------------------------
 -- 2. agent_messages
@@ -64,33 +115,33 @@ CREATE INDEX IF NOT EXISTS idx_agent_sessions_module    ON agent_sessions(module
 --    backing store for langchain4j's ChatMemory.
 -- ----------------------------------------------------------
 CREATE TABLE IF NOT EXISTS agent_messages (
-    message_id      BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    session_id      UUID NOT NULL REFERENCES agent_sessions(session_id)
-                        ON DELETE CASCADE ON UPDATE CASCADE,
-    message_index   INTEGER NOT NULL,              -- ordinal position within the session
-    role            TEXT NOT NULL CHECK (role IN ('system','user','assistant','tool')),
-    content         TEXT,                          -- main text content (nullable for tool calls)
-    tool_call_id    TEXT,                          -- correlates a tool response to its call
-    tool_name       TEXT,                          -- the name of the tool that was invoked
-    tool_call_args  JSONB,                         -- arguments passed to the tool (JSON)
-    tool_result      TEXT,                          -- text result returned by the tool
-    token_count     INTEGER,                       -- optional output token usage for this message
-    input_token_count INTEGER,                      -- optional input token usage for the LLM call that produced this message
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    message_id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    session_id          UUID NOT NULL REFERENCES agent_sessions(session_id)
+                            ON DELETE CASCADE ON UPDATE CASCADE,
+    message_index       INTEGER NOT NULL,              -- ordinal position within the session
+    role                TEXT NOT NULL CHECK (role IN ('system','user','assistant','tool')),
+    content             TEXT,                          -- main text content (nullable for tool calls)
+    tool_call_id        TEXT,                          -- correlates a tool response to its call
+    tool_name           TEXT,                          -- the name of the tool that was invoked
+    tool_call_args      JSONB,                         -- arguments passed to the tool (JSON)
+    tool_result         TEXT,                          -- text result returned by the tool
+    token_count         INTEGER,                       -- optional output token usage for this message
+    input_token_count   INTEGER,                       -- optional input token usage for the LLM call that produced this message
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-SELECT assert_column_type('public', 'agent_messages', 'message_id',     'int8');
-SELECT assert_column_type('public', 'agent_messages', 'session_id',     'uuid');
-SELECT assert_column_type('public', 'agent_messages', 'message_index',  'int4');
-SELECT assert_column_type('public', 'agent_messages', 'role',           'text');
-SELECT assert_column_type('public', 'agent_messages', 'content',        'text');
-SELECT assert_column_type('public', 'agent_messages', 'tool_call_id',   'text');
-SELECT assert_column_type('public', 'agent_messages', 'tool_name',      'text');
-SELECT assert_column_type('public', 'agent_messages', 'tool_call_args', 'jsonb');
-SELECT assert_column_type('public', 'agent_messages', 'tool_result',    'text');
-SELECT assert_column_type('public', 'agent_messages', 'token_count',    'int4');
+SELECT assert_column_type('public', 'agent_messages', 'message_id',        'int8');
+SELECT assert_column_type('public', 'agent_messages', 'session_id',        'uuid');
+SELECT assert_column_type('public', 'agent_messages', 'message_index',     'int4');
+SELECT assert_column_type('public', 'agent_messages', 'role',              'text');
+SELECT assert_column_type('public', 'agent_messages', 'content',           'text');
+SELECT assert_column_type('public', 'agent_messages', 'tool_call_id',      'text');
+SELECT assert_column_type('public', 'agent_messages', 'tool_name',         'text');
+SELECT assert_column_type('public', 'agent_messages', 'tool_call_args',    'jsonb');
+SELECT assert_column_type('public', 'agent_messages', 'tool_result',       'text');
+SELECT assert_column_type('public', 'agent_messages', 'token_count',       'int4');
 SELECT assert_column_type('public', 'agent_messages', 'input_token_count', 'int4');
-SELECT assert_column_type('public', 'agent_messages', 'created_at',     'timestamptz');
+SELECT assert_column_type('public', 'agent_messages', 'created_at',        'timestamptz');
 
 CREATE INDEX IF NOT EXISTS idx_agent_messages_session ON agent_messages(session_id, message_index);
 
@@ -117,16 +168,16 @@ CREATE TABLE IF NOT EXISTS agent_memories (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-SELECT assert_column_type('public', 'agent_memories', 'memory_id',   'int8');
-SELECT assert_column_type('public', 'agent_memories', 'session_id',  'uuid');
-SELECT assert_column_type('public', 'agent_memories', 'binary_id',  'int4');
-SELECT assert_column_type('public', 'agent_memories', 'memory_type', 'text');
-SELECT assert_column_type('public', 'agent_memories', 'scope',       'text');
-SELECT assert_column_type('public', 'agent_memories', 'key',         'text');
-SELECT assert_column_type('public', 'agent_memories', 'content',     'text');
-SELECT assert_column_type('public', 'agent_memories', 'importance',  'float4');
-SELECT assert_column_type('public', 'agent_memories', 'metadata',    'jsonb');
-SELECT assert_column_type('public', 'agent_memories', 'created_at',  'timestamptz');
+SELECT assert_column_type('public', 'agent_memories', 'memory_id',    'int8');
+SELECT assert_column_type('public', 'agent_memories', 'session_id',   'uuid');
+SELECT assert_column_type('public', 'agent_memories', 'binary_id',    'int4');
+SELECT assert_column_type('public', 'agent_memories', 'memory_type',  'text');
+SELECT assert_column_type('public', 'agent_memories', 'scope',        'text');
+SELECT assert_column_type('public', 'agent_memories', 'key',          'text');
+SELECT assert_column_type('public', 'agent_memories', 'content',      'text');
+SELECT assert_column_type('public', 'agent_memories', 'importance',   'float4');
+SELECT assert_column_type('public', 'agent_memories', 'metadata',     'jsonb');
+SELECT assert_column_type('public', 'agent_memories', 'created_at',   'timestamptz');
 
 CREATE INDEX IF NOT EXISTS idx_agent_memories_session    ON agent_memories(session_id);
 CREATE INDEX IF NOT EXISTS idx_agent_memories_binary     ON agent_memories(binary_id);
@@ -138,94 +189,86 @@ CREATE INDEX IF NOT EXISTS idx_agent_memories_type_scope ON agent_memories(memor
 --    arguments, how long it took, and whether it succeeded.
 -- ----------------------------------------------------------
 CREATE TABLE IF NOT EXISTS agent_tool_calls (
-    call_id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    call_id                BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    session_id             UUID NOT NULL REFERENCES agent_sessions(session_id)
+                               ON DELETE CASCADE ON UPDATE CASCADE,
+    message_id             BIGINT REFERENCES agent_messages(message_id)
+                               ON DELETE SET NULL ON UPDATE CASCADE,
+    node_id                TEXT,                          -- which graph node issued this call
+    tool_call_id           TEXT,                          -- provider/framework tool-call id
+    tool_name              TEXT NOT NULL,
+    tool_args              JSONB,                         -- arguments as JSON
+    result_uuid            UUID,                          -- FK-like pointer to agent_tool_call_results.result_uuid
+    result_summary         TEXT,                          -- truncated result for audit
+    result_original_bytes  INTEGER,
+    result_stored_bytes    INTEGER,
+    result_truncated       BOOLEAN,
+    result_sha256          TEXT,
+    storage_policy         TEXT,
+    success                BOOLEAN NOT NULL DEFAULT true,
+    duration_ms            BIGINT,                        -- wall-clock duration in milliseconds
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+SELECT assert_column_type('public', 'agent_tool_calls', 'call_id',               'int8');
+SELECT assert_column_type('public', 'agent_tool_calls', 'session_id',            'uuid');
+SELECT assert_column_type('public', 'agent_tool_calls', 'message_id',            'int8');
+SELECT assert_column_type('public', 'agent_tool_calls', 'node_id',               'text');
+SELECT assert_column_type('public', 'agent_tool_calls', 'tool_call_id',          'text');
+SELECT assert_column_type('public', 'agent_tool_calls', 'tool_name',             'text');
+SELECT assert_column_type('public', 'agent_tool_calls', 'tool_args',             'jsonb');
+SELECT assert_column_type('public', 'agent_tool_calls', 'result_uuid',           'uuid');
+SELECT assert_column_type('public', 'agent_tool_calls', 'result_summary',        'text');
+SELECT assert_column_type('public', 'agent_tool_calls', 'result_original_bytes', 'int4');
+SELECT assert_column_type('public', 'agent_tool_calls', 'result_stored_bytes',   'int4');
+SELECT assert_column_type('public', 'agent_tool_calls', 'result_truncated',      'bool');
+SELECT assert_column_type('public', 'agent_tool_calls', 'result_sha256',         'text');
+SELECT assert_column_type('public', 'agent_tool_calls', 'storage_policy',        'text');
+SELECT assert_column_type('public', 'agent_tool_calls', 'success',               'bool');
+SELECT assert_column_type('public', 'agent_tool_calls', 'duration_ms',           'int8');
+SELECT assert_column_type('public', 'agent_tool_calls', 'created_at',            'timestamptz');
+
+CREATE INDEX IF NOT EXISTS idx_agent_tool_calls_session      ON agent_tool_calls(session_id);
+CREATE INDEX IF NOT EXISTS idx_agent_tool_calls_result_uuid  ON agent_tool_calls(result_uuid);
+
+CREATE TABLE IF NOT EXISTS agent_tool_call_results (
+    result_uuid     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    call_id         BIGINT REFERENCES agent_tool_calls(call_id)
+                        ON DELETE CASCADE ON UPDATE CASCADE,
     session_id      UUID NOT NULL REFERENCES agent_sessions(session_id)
                         ON DELETE CASCADE ON UPDATE CASCADE,
     message_id      BIGINT REFERENCES agent_messages(message_id)
                         ON DELETE SET NULL ON UPDATE CASCADE,
-    node_id         TEXT,                          -- which graph node issued this call
-    tool_call_id    TEXT,                          -- provider/framework tool-call id
+    tool_call_id    TEXT,
     tool_name       TEXT NOT NULL,
-    tool_args       JSONB,                         -- arguments as JSON
-    result_uuid     UUID,                          -- FK-like pointer to agent_tool_call_results.result_uuid
-    result_summary  TEXT,                          -- truncated result for audit
-    result_original_bytes INTEGER,
-    result_stored_bytes INTEGER,
-    result_truncated BOOLEAN,
-    result_sha256   TEXT,
-    storage_policy  TEXT,
-    success         BOOLEAN NOT NULL DEFAULT true,
-    duration_ms     BIGINT,                        -- wall-clock duration in milliseconds
+    tool_args       JSONB,
+    content         TEXT NOT NULL,
+    original_bytes  INTEGER NOT NULL,
+    stored_bytes    INTEGER NOT NULL,
+    truncated       BOOLEAN NOT NULL DEFAULT false,
+    sha256          TEXT,
+    storage_policy  TEXT NOT NULL DEFAULT 'full',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS tool_call_id TEXT;
-ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS result_uuid UUID;
-ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS result_original_bytes INTEGER;
-ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS result_stored_bytes INTEGER;
-ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS result_truncated BOOLEAN;
-ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS result_sha256 TEXT;
-ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS storage_policy TEXT;
+SELECT assert_column_type('public', 'agent_tool_call_results', 'result_uuid',     'uuid');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'call_id',         'int8');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'session_id',      'uuid');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'message_id',      'int8');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'tool_call_id',    'text');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'tool_name',       'text');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'tool_args',       'jsonb');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'content',         'text');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'original_bytes',  'int4');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'stored_bytes',    'int4');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'truncated',       'bool');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'sha256',          'text');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'storage_policy',  'text');
+SELECT assert_column_type('public', 'agent_tool_call_results', 'created_at',      'timestamptz');
 
-SELECT assert_column_type('public', 'agent_tool_calls', 'call_id',        'int8');
-SELECT assert_column_type('public', 'agent_tool_calls', 'session_id',     'uuid');
-SELECT assert_column_type('public', 'agent_tool_calls', 'message_id',     'int8');
-SELECT assert_column_type('public', 'agent_tool_calls', 'node_id',        'text');
-SELECT assert_column_type('public', 'agent_tool_calls', 'tool_call_id',   'text');
-SELECT assert_column_type('public', 'agent_tool_calls', 'tool_name',      'text');
-SELECT assert_column_type('public', 'agent_tool_calls', 'tool_args',      'jsonb');
-SELECT assert_column_type('public', 'agent_tool_calls', 'result_uuid',    'uuid');
-SELECT assert_column_type('public', 'agent_tool_calls', 'result_summary', 'text');
-SELECT assert_column_type('public', 'agent_tool_calls', 'result_original_bytes', 'int4');
-SELECT assert_column_type('public', 'agent_tool_calls', 'result_stored_bytes', 'int4');
-SELECT assert_column_type('public', 'agent_tool_calls', 'result_truncated', 'bool');
-SELECT assert_column_type('public', 'agent_tool_calls', 'result_sha256',   'text');
-SELECT assert_column_type('public', 'agent_tool_calls', 'storage_policy',  'text');
-SELECT assert_column_type('public', 'agent_tool_calls', 'success',        'bool');
-SELECT assert_column_type('public', 'agent_tool_calls', 'duration_ms',    'int8');
-SELECT assert_column_type('public', 'agent_tool_calls', 'created_at',     'timestamptz');
-
-CREATE INDEX IF NOT EXISTS idx_agent_tool_calls_session ON agent_tool_calls(session_id);
-CREATE INDEX IF NOT EXISTS idx_agent_tool_calls_result_uuid ON agent_tool_calls(result_uuid);
-
-CREATE TABLE IF NOT EXISTS agent_tool_call_results (
-    result_uuid    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    call_id        BIGINT REFERENCES agent_tool_calls(call_id)
-                       ON DELETE CASCADE ON UPDATE CASCADE,
-    session_id     UUID NOT NULL REFERENCES agent_sessions(session_id)
-                       ON DELETE CASCADE ON UPDATE CASCADE,
-    message_id     BIGINT REFERENCES agent_messages(message_id)
-                       ON DELETE SET NULL ON UPDATE CASCADE,
-    tool_call_id   TEXT,
-    tool_name      TEXT NOT NULL,
-    tool_args      JSONB,
-    content        TEXT NOT NULL,
-    original_bytes INTEGER NOT NULL,
-    stored_bytes   INTEGER NOT NULL,
-    truncated      BOOLEAN NOT NULL DEFAULT false,
-    sha256         TEXT,
-    storage_policy TEXT NOT NULL DEFAULT 'full',
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-SELECT assert_column_type('public', 'agent_tool_call_results', 'result_uuid',    'uuid');
-SELECT assert_column_type('public', 'agent_tool_call_results', 'call_id',        'int8');
-SELECT assert_column_type('public', 'agent_tool_call_results', 'session_id',     'uuid');
-SELECT assert_column_type('public', 'agent_tool_call_results', 'message_id',     'int8');
-SELECT assert_column_type('public', 'agent_tool_call_results', 'tool_call_id',   'text');
-SELECT assert_column_type('public', 'agent_tool_call_results', 'tool_name',      'text');
-SELECT assert_column_type('public', 'agent_tool_call_results', 'tool_args',      'jsonb');
-SELECT assert_column_type('public', 'agent_tool_call_results', 'content',        'text');
-SELECT assert_column_type('public', 'agent_tool_call_results', 'original_bytes', 'int4');
-SELECT assert_column_type('public', 'agent_tool_call_results', 'stored_bytes',   'int4');
-SELECT assert_column_type('public', 'agent_tool_call_results', 'truncated',      'bool');
-SELECT assert_column_type('public', 'agent_tool_call_results', 'sha256',         'text');
-SELECT assert_column_type('public', 'agent_tool_call_results', 'storage_policy', 'text');
-SELECT assert_column_type('public', 'agent_tool_call_results', 'created_at',     'timestamptz');
-
-CREATE INDEX IF NOT EXISTS idx_agent_tool_call_results_session ON agent_tool_call_results(session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_agent_tool_call_results_session     ON agent_tool_call_results(session_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_agent_tool_call_results_session_sha ON agent_tool_call_results(session_id, sha256);
-CREATE INDEX IF NOT EXISTS idx_agent_tool_call_results_call_id ON agent_tool_call_results(call_id);
+CREATE INDEX IF NOT EXISTS idx_agent_tool_call_results_call_id    ON agent_tool_call_results(call_id);
 
 -- ----------------------------------------------------------
 -- 5. agent_session_contexts
@@ -259,26 +302,26 @@ SELECT assert_column_type('public', 'agent_session_contexts', 'updated_at',     
 --    describes which agents exist and how they are connected.
 -- ----------------------------------------------------------
 CREATE TABLE IF NOT EXISTS agent_graphs (
-    graph_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    session_id      UUID NOT NULL REFERENCES agent_sessions(session_id)
-                        ON DELETE CASCADE ON UPDATE CASCADE,
-    graph_name      TEXT,                          -- optional label
-    entry_node      TEXT,                          -- node_id of the entry point
-    max_iterations  INTEGER DEFAULT 10,            -- safety limit for cycle resolution
-    convergence_threshold REAL DEFAULT 0.95,       -- for CONVERGENCE cycle strategy
-    cycle_strategy  TEXT NOT NULL DEFAULT 'MAX_ITERATIONS'
-                        CHECK (cycle_strategy IN ('MAX_ITERATIONS','CONVERGENCE','MANUAL')),
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    graph_id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id             UUID NOT NULL REFERENCES agent_sessions(session_id)
+                               ON DELETE CASCADE ON UPDATE CASCADE,
+    graph_name             TEXT,                          -- optional label
+    entry_node             TEXT,                          -- node_id of the entry point
+    max_iterations         INTEGER DEFAULT 10,            -- safety limit for cycle resolution
+    convergence_threshold  REAL DEFAULT 0.95,              -- for CONVERGENCE cycle strategy
+    cycle_strategy         TEXT NOT NULL DEFAULT 'MAX_ITERATIONS'
+                               CHECK (cycle_strategy IN ('MAX_ITERATIONS','CONVERGENCE','MANUAL')),
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-SELECT assert_column_type('public', 'agent_graphs', 'graph_id',             'uuid');
-SELECT assert_column_type('public', 'agent_graphs', 'session_id',           'uuid');
-SELECT assert_column_type('public', 'agent_graphs', 'graph_name',           'text');
-SELECT assert_column_type('public', 'agent_graphs', 'entry_node',           'text');
-SELECT assert_column_type('public', 'agent_graphs', 'max_iterations',       'int4');
-SELECT assert_column_type('public', 'agent_graphs', 'convergence_threshold','float4');
-SELECT assert_column_type('public', 'agent_graphs', 'cycle_strategy',       'text');
-SELECT assert_column_type('public', 'agent_graphs', 'created_at',           'timestamptz');
+SELECT assert_column_type('public', 'agent_graphs', 'graph_id',              'uuid');
+SELECT assert_column_type('public', 'agent_graphs', 'session_id',            'uuid');
+SELECT assert_column_type('public', 'agent_graphs', 'graph_name',            'text');
+SELECT assert_column_type('public', 'agent_graphs', 'entry_node',            'text');
+SELECT assert_column_type('public', 'agent_graphs', 'max_iterations',        'int4');
+SELECT assert_column_type('public', 'agent_graphs', 'convergence_threshold', 'float4');
+SELECT assert_column_type('public', 'agent_graphs', 'cycle_strategy',        'text');
+SELECT assert_column_type('public', 'agent_graphs', 'created_at',            'timestamptz');
 
 CREATE INDEX IF NOT EXISTS idx_agent_graphs_session ON agent_graphs(session_id);
 
@@ -477,3 +520,94 @@ SELECT assert_column_type('public', 'script_executions', 'output',        'text'
 SELECT assert_column_type('public', 'script_executions', 'error_message', 'text');
 SELECT assert_column_type('public', 'script_executions', 'started_at',    'timestamptz');
 SELECT assert_column_type('public', 'script_executions', 'finished_at',   'timestamptz');
+
+-- ============================================================
+-- 13. agent_mailbox_messages
+--     Point-to-point asynchronous messages between agent
+--     sessions. The schema is intentionally narrow: a body,
+--     a kind, an optional related-artifact pointer, and an
+--     optional reply pointer. Larger payloads should travel
+--     through agent_artifacts and be referenced by id.
+--     Lifecycle access control is enforced at the route layer
+--     (see MailboxOps.send_message), not in SQL — the schema
+--     itself just stores what was sent.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS agent_mailbox_messages (
+    message_id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    sender_session_id      UUID NOT NULL REFERENCES agent_sessions(session_id)
+                               ON DELETE CASCADE ON UPDATE CASCADE,
+    recipient_session_id   UUID NOT NULL REFERENCES agent_sessions(session_id)
+                               ON DELETE CASCADE ON UPDATE CASCADE,
+    kind                   TEXT NOT NULL DEFAULT 'note'
+                               CHECK (kind IN ('note','request','reply','cancel','heartbeat')),
+    subject                TEXT,
+    body                   TEXT NOT NULL,
+    related_artifact_id    BIGINT,                       -- soft FK; no ON DELETE to avoid cascade surprises
+    in_reply_to_message_id BIGINT,                       -- threading for replies / cancellation chains
+    priority               INTEGER NOT NULL DEFAULT 0,   -- higher = delivered first
+    read_at                TIMESTAMPTZ,                  -- when drained by recipient
+    acked_at               TIMESTAMPTZ,                  -- when recipient explicitly acknowledged
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+SELECT assert_column_type('public', 'agent_mailbox_messages', 'message_id',             'int8');
+SELECT assert_column_type('public', 'agent_mailbox_messages', 'sender_session_id',      'uuid');
+SELECT assert_column_type('public', 'agent_mailbox_messages', 'recipient_session_id',   'uuid');
+SELECT assert_column_type('public', 'agent_mailbox_messages', 'kind',                   'text');
+SELECT assert_column_type('public', 'agent_mailbox_messages', 'subject',                'text');
+SELECT assert_column_type('public', 'agent_mailbox_messages', 'body',                   'text');
+SELECT assert_column_type('public', 'agent_mailbox_messages', 'related_artifact_id',    'int8');
+SELECT assert_column_type('public', 'agent_mailbox_messages', 'in_reply_to_message_id', 'int8');
+SELECT assert_column_type('public', 'agent_mailbox_messages', 'priority',               'int4');
+SELECT assert_column_type('public', 'agent_mailbox_messages', 'read_at',                'timestamptz');
+SELECT assert_column_type('public', 'agent_mailbox_messages', 'acked_at',               'timestamptz');
+SELECT assert_column_type('public', 'agent_mailbox_messages', 'created_at',             'timestamptz');
+
+CREATE INDEX IF NOT EXISTS idx_mailbox_recipient_unread
+    ON agent_mailbox_messages(recipient_session_id, read_at, priority DESC, created_at);
+CREATE INDEX IF NOT EXISTS idx_mailbox_recipient_created
+    ON agent_mailbox_messages(recipient_session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_mailbox_sender
+    ON agent_mailbox_messages(sender_session_id, created_at);
+
+-- ============================================================
+-- 14. agent_artifacts
+--     Named, versioned blobs shared between agents. Each
+--     artifact is owned by exactly one session, but can be
+--     marked is_public=true so other sessions can read it by
+--     name. The version column enables incremental updates
+--     without losing the previous blob (for audit / rollback).
+-- ============================================================
+CREATE TABLE IF NOT EXISTS agent_artifacts (
+    artifact_id       BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    owner_session_id  UUID NOT NULL REFERENCES agent_sessions(session_id)
+                          ON DELETE CASCADE ON UPDATE CASCADE,
+    name              TEXT NOT NULL,
+    version           INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+    kind              TEXT NOT NULL DEFAULT 'data'
+                          CHECK (kind IN ('data','finding','plan','note','code','reference')),
+    content           TEXT NOT NULL,
+    summary           TEXT,
+    metadata          JSONB,
+    is_public         BOOLEAN NOT NULL DEFAULT false,
+    superseded_by     BIGINT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (owner_session_id, name, version)
+);
+
+SELECT assert_column_type('public', 'agent_artifacts', 'artifact_id',      'int8');
+SELECT assert_column_type('public', 'agent_artifacts', 'owner_session_id', 'uuid');
+SELECT assert_column_type('public', 'agent_artifacts', 'name',             'text');
+SELECT assert_column_type('public', 'agent_artifacts', 'version',          'int4');
+SELECT assert_column_type('public', 'agent_artifacts', 'kind',             'text');
+SELECT assert_column_type('public', 'agent_artifacts', 'content',          'text');
+SELECT assert_column_type('public', 'agent_artifacts', 'summary',          'text');
+SELECT assert_column_type('public', 'agent_artifacts', 'metadata',         'jsonb');
+SELECT assert_column_type('public', 'agent_artifacts', 'is_public',        'bool');
+SELECT assert_column_type('public', 'agent_artifacts', 'superseded_by',    'int8');
+SELECT assert_column_type('public', 'agent_artifacts', 'created_at',       'timestamptz');
+
+CREATE INDEX IF NOT EXISTS idx_artifacts_owner_name
+    ON agent_artifacts(owner_session_id, name, version DESC);
+CREATE INDEX IF NOT EXISTS idx_artifacts_public
+    ON agent_artifacts(is_public) WHERE is_public = true;

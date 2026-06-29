@@ -4,9 +4,11 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.server.response.respond
 import io.ktor.server.routing.*
 import org.iotsplab.akiba.dbDaemon.operations.AgentOps
+import org.iotsplab.akiba.dbDaemon.operations.ArtifactOps
 import org.iotsplab.akiba.dbDaemon.operations.Backups
 import org.iotsplab.akiba.dbDaemon.operations.Controls
 import org.iotsplab.akiba.dbDaemon.operations.Insertions
+import org.iotsplab.akiba.dbDaemon.operations.MailboxOps
 import org.iotsplab.akiba.dbDaemon.operations.Modules
 import org.iotsplab.akiba.dbDaemon.operations.PGInstances
 import org.iotsplab.akiba.dbDaemon.operations.Queries
@@ -50,8 +52,14 @@ object RouteRegistry {
         // Agent Framework routes
         AgentOps.CreateSession,
         AgentOps.GetSession,
+        AgentOps.GetSessionChildren,
         AgentOps.ListSessions,
         AgentOps.UpdateSession,
+        AgentOps.SetSessionLifecycle,
+        AgentOps.SetRuntimeState,
+        AgentOps.GetRuntimeState,
+        AgentOps.ListLiveSubtree,
+        AgentOps.GetAgentStatus,
 
         AgentOps.AppendMessages,
         AgentOps.GetMessages,
@@ -79,6 +87,20 @@ object RouteRegistry {
         AgentOps.FindToolCallResults,
         AgentOps.GetToolCallResult,
         AgentOps.AppendTranscript,
+
+        // Mailbox routes
+        MailboxOps.SendMessage,
+        MailboxOps.ListMessages,
+        MailboxOps.DrainMessages,
+        MailboxOps.AckMessage,
+        MailboxOps.CountUnread,
+        MailboxOps.GetMessage,
+
+        // Artifact routes
+        ArtifactOps.PublishArtifact,
+        ArtifactOps.GetArtifact,
+        ArtifactOps.ListArtifacts,
+        ArtifactOps.DeleteArtifact,
 
         // Script routes
         ScriptOps.CreateScript,
