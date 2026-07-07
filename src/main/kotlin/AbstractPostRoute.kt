@@ -58,6 +58,7 @@ abstract class AbstractPostRoute {
                 // User data not valid
                 globalLogger.error("Content format error: ${e.message}")
                 call.respond(HttpStatusCode.BadRequest)
+                return@post
             } catch(e: Exception) {
                 call.respond(HttpStatusCode.InternalServerError)
                 globalLogger.error("Internal server error occurred on POST $path: ${e.message}")
@@ -66,10 +67,10 @@ abstract class AbstractPostRoute {
             }
 
             if (respond) {
-                if (result == null) {
-                    call.respond(HttpStatusCode.OK)
-                } else {
-                    call.respond(result)
+                when (result) {
+                    null -> call.respond(HttpStatusCode.OK)
+                    is HttpStatusCode -> call.respond(result)
+                    else -> call.respond(result)
                 }
             }
         }

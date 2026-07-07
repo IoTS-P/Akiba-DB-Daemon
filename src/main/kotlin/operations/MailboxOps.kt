@@ -18,6 +18,16 @@ import java.util.UUID
  */
 object MailboxOps {
 
+    /**
+     * Well-known UUID for the reserved "system" sender used by
+     * [org.iotsplab.akiba.llm.agent.AgentMailboxDispatcher] when
+     * delivering synthetic wake-condition messages.  The row is
+     * created lazily by [SendMessage] on first use so the
+     * `sender_session_id` FK on `agent_mailbox_messages` is
+     * satisfied.
+     */
+    private const val SYSTEM_SESSION_UUID = "00000000-0000-0000-0000-000000000000"
+
     // ============================================================
     //  Row mapping
     // ============================================================
@@ -75,7 +85,16 @@ object MailboxOps {
                 )
             if (req.body.isBlank())
                 return HttpStatusCode.BadRequest.description("body must not be blank")
-            if (req.senderSessionId == req.recipientSessionId)
+
+            // Translate the reserved "system" sender to the well-known
+            // system session UUID.  The framework's wake-condition
+            // dispatcher uses "system" for synthetic wake messages that
+            // have no real sender session; the UUID is required to
+            // satisfy the sender_session_id FK + NOT-NULL constraint.
+            val isSystemSender = req.senderSessionId == "system"
+            val senderSessionId = if (isSystemSender) SYSTEM_SESSION_UUID else req.senderSessionId
+
+            if (senderSessionId == req.recipientSessionId)
                 return HttpStatusCode.BadRequest.description(
                     "Sender and recipient must differ"
                 )
@@ -87,15 +106,32 @@ object MailboxOps {
             var recipientLifecycle: String? = null
             var recipientStatus: String? = null
             fa.session.useDb { conn ->
-                conn.prepareStatement(
-                    "SELECT status FROM agent_sessions WHERE session_id = ?::uuid"
-                ).use { ps ->
-                    ps.setString(1, req.senderSessionId)
-                    val rs = ps.executeQuery()
-                    if (rs.next()) {
-                        senderOk = true
-                        val s = rs.getString("status")
-                        senderTerminal = s == "completed" || s == "error"
+                if (isSystemSender) {
+                    // Lazily create the system session so the FK on
+                    // sender_session_id is satisfied.  ON CONFLICT makes
+                    // this idempotent — a no-op after the first call.
+                    conn.prepareStatement(
+                        """INSERT INTO agent_sessions
+                               (session_id, session_name, status, lifecycle, runtime_state)
+                           VALUES (?::uuid, 'system', 'running', 'one_shot', 'running')
+                           ON CONFLICT (session_id) DO NOTHING"""
+                    ).use { ps ->
+                        ps.setString(1, SYSTEM_SESSION_UUID)
+                        ps.executeUpdate()
+                    }
+                    senderOk = true
+                    senderTerminal = false
+                } else {
+                    conn.prepareStatement(
+                        "SELECT status FROM agent_sessions WHERE session_id = ?::uuid"
+                    ).use { ps ->
+                        ps.setString(1, senderSessionId)
+                        val rs = ps.executeQuery()
+                        if (rs.next()) {
+                            senderOk = true
+                            val s = rs.getString("status")
+                            senderTerminal = s == "completed" || s == "error"
+                        }
                     }
                 }
                 conn.prepareStatement(
@@ -113,7 +149,7 @@ object MailboxOps {
 
             if (!senderOk)
                 return HttpStatusCode.NotFound.description(
-                    "Sender session '${req.senderSessionId}' not found"
+                    "Sender session '$senderSessionId' not found"
                 )
             if (!recipientOk)
                 return HttpStatusCode.NotFound.description(
@@ -121,7 +157,7 @@ object MailboxOps {
                 )
             if (senderTerminal)
                 return HttpStatusCode.Forbidden.description(
-                    "Sender session '${req.senderSessionId}' is terminal ($recipientStatus); cannot send"
+                    "Sender session '$senderSessionId' is terminal ($recipientStatus); cannot send"
                 )
 
             // Lifecycle access control: one-shot sessions are terminal by design.
@@ -145,7 +181,7 @@ object MailboxOps {
                     RETURNING message_id
                     """.trimIndent()
                 ).use { ps ->
-                    ps.setString(1, req.senderSessionId)
+                    ps.setString(1, senderSessionId)
                     ps.setString(2, req.recipientSessionId)
                     ps.setString(3, req.kind)
                     ps.setString(4, req.subject)
@@ -172,6 +208,12 @@ object MailboxOps {
             val sessionId: String,
             val limit: Int = 50,
             val includeRead: Boolean = false,
+            /** When true, return only messages that have been read
+             *  (read_at IS NOT NULL) but NOT yet acked (acked_at IS NULL).
+             *  This is the "pending" set — items the agent has seen in a
+             *  previous wake but hasn't handled yet.  Takes precedence
+             *  over [includeRead] when both are set. */
+            val onlyPending: Boolean = false,
         )
 
         override suspend fun handle(ctx: RouteContext): Any? {
@@ -181,6 +223,12 @@ object MailboxOps {
             val results: MutableList<Map<String, Any?>> = mutableListOf()
             val safeLimit = req.limit.coerceIn(1, 500)
 
+            val readFilter = when {
+                req.onlyPending -> "AND read_at IS NOT NULL AND acked_at IS NULL"
+                !req.includeRead -> "AND read_at IS NULL"
+                else -> ""
+            }
+
             fa.session.useDb { conn ->
                 val sql = """
                     SELECT message_id, sender_session_id, recipient_session_id, kind, subject, body,
@@ -188,7 +236,7 @@ object MailboxOps {
                            read_at, acked_at, created_at
                     FROM agent_mailbox_messages
                     WHERE recipient_session_id = ?::uuid
-                      ${if (!req.includeRead) "AND read_at IS NULL" else ""}
+                      $readFilter
                     ORDER BY priority DESC, created_at ASC
                     LIMIT ?
                 """.trimIndent()
@@ -278,6 +326,7 @@ object MailboxOps {
             val fa = try { fastAccess(ctx) } catch (e: FastAccessException) { return e.code }
 
             var updated = 0
+            var alreadyAcked = false
             fa.session.useDb { conn ->
                 conn.prepareStatement(
                     """
@@ -290,11 +339,32 @@ object MailboxOps {
                     ps.setString(2, req.sessionId)
                     updated = ps.executeUpdate()
                 }
+                // If the UPDATE matched 0 rows, check whether the message
+                // exists and is already acked.  If so, this is an
+                // idempotent re-ack — return OK instead of 404 so the
+                // caller doesn't treat an already-handled message as an
+                // error and get stuck retrying.
+                if (updated == 0) {
+                    conn.prepareStatement(
+                        """
+                        SELECT 1 FROM agent_mailbox_messages
+                        WHERE message_id = ? AND recipient_session_id = ?::uuid
+                          AND acked_at IS NOT NULL
+                        """.trimIndent()
+                    ).use { ps ->
+                        ps.setLong(1, req.messageId)
+                        ps.setString(2, req.sessionId)
+                        alreadyAcked = ps.executeQuery().next()
+                    }
+                }
             }
-            return if (updated > 0) HttpStatusCode.OK.description("Message acknowledged")
-            else HttpStatusCode.NotFound.description(
-                "Message ${req.messageId} not found in session ${req.sessionId}'s mailbox or already acked"
-            )
+            return when {
+                updated > 0 -> HttpStatusCode.OK.description("Message acknowledged")
+                alreadyAcked -> HttpStatusCode.OK.description("Message already acknowledged")
+                else -> HttpStatusCode.NotFound.description(
+                    "Message ${req.messageId} not found in session ${req.sessionId}'s mailbox"
+                )
+            }
         }
     }
 
