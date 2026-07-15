@@ -78,7 +78,7 @@ object MailboxOps {
             val req = ctx.receive<Request>()
             val fa = try { fastAccess(ctx) } catch (e: FastAccessException) { return e.code }
 
-            val validKinds = setOf("note", "request", "reply", "cancel", "heartbeat")
+            val validKinds = setOf("note", "request", "reply", "cancel", "heartbeat", "user-hint")
             if (req.kind !in validKinds)
                 return HttpStatusCode.BadRequest.description(
                     "Invalid kind: ${req.kind}. Must be one of $validKinds"
@@ -331,7 +331,8 @@ object MailboxOps {
                 conn.prepareStatement(
                     """
                     UPDATE agent_mailbox_messages
-                    SET acked_at = now()
+                    SET acked_at = now(),
+                        read_at = COALESCE(read_at, now())
                     WHERE message_id = ? AND recipient_session_id = ?::uuid AND acked_at IS NULL
                     """.trimIndent()
                 ).use { ps ->

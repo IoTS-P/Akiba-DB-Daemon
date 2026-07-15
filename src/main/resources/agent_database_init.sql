@@ -77,28 +77,6 @@ SELECT assert_column_type('public', 'agent_sessions', 'resumed_at',        'time
 SELECT assert_column_type('public', 'agent_sessions', 'completed_at',      'timestamptz');
 SELECT assert_column_type('public', 'agent_sessions', 'transcript',        'text');
 
--- Migrate older instances whose `status` column used the legacy
--- active/suspended/completed/error vocabulary.  From this point on
--- `status` mirrors `runtime_state`; `closing_reason` carries the
--- difference between normal close and cancellation.
-ALTER TABLE agent_sessions ALTER COLUMN status SET DEFAULT 'running';
-ALTER TABLE agent_sessions DROP CONSTRAINT IF EXISTS agent_sessions_status_check;
-UPDATE agent_sessions
-SET status = CASE
-    WHEN runtime_state IN ('running','standby','msghandle','cancelling','closed','error') THEN runtime_state
-    WHEN status = 'active' THEN 'running'
-    WHEN status = 'suspended' THEN 'standby'
-    WHEN status = 'completed' THEN 'closed'
-    WHEN status = 'cancelled' THEN 'closed'
-    WHEN status = 'failed' THEN 'error'
-    ELSE 'running'
-END
-WHERE status NOT IN ('running','standby','msghandle','cancelling','closed','error')
-   OR status <> runtime_state;
-ALTER TABLE agent_sessions
-    ADD CONSTRAINT agent_sessions_status_check
-    CHECK (status IN ('running','standby','msghandle','cancelling','closed','error'));
-
 CREATE INDEX IF NOT EXISTS idx_agent_sessions_status            ON agent_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_agent_sessions_binary_id         ON agent_sessions(binary_id);
 CREATE INDEX IF NOT EXISTS idx_agent_sessions_module            ON agent_sessions(module_name);
@@ -539,7 +517,7 @@ CREATE TABLE IF NOT EXISTS agent_mailbox_messages (
     recipient_session_id   UUID NOT NULL REFERENCES agent_sessions(session_id)
                                ON DELETE CASCADE ON UPDATE CASCADE,
     kind                   TEXT NOT NULL DEFAULT 'note'
-                               CHECK (kind IN ('note','request','reply','cancel','heartbeat')),
+                               CHECK (kind IN ('note','request','reply','cancel','heartbeat','user-hint')),
     subject                TEXT,
     body                   TEXT NOT NULL,
     related_artifact_id    BIGINT,                       -- soft FK; no ON DELETE to avoid cascade surprises

@@ -407,11 +407,56 @@ object AgentOps {
     }
 
     /**
-     * Set the session's `lifecycle`. The framework sets this once at
-     * agent creation; downstream transitions stay out of this route
-     * so the orchestrator remains the single source of truth for the
-     * session state machine.
+     * Hard-delete a session and all of its descendants.
+     *
+     * Uses a recursive CTE to collect the root session and every
+     * child / grandchild / etc.  All rows are deleted in one SQL
+     * statement.  The CASCADE FK constraints on dependent tables
+     * (agent_messages, agent_tool_calls, agent_graphs, etc.) ensure
+     * a clean removal.
+     *
+     * The caller (AgentRoutes) is responsible for checking that the
+     * session is NOT in a running state before calling this route.
      */
+    object DeleteSession : AbstractPostRoute() {
+        override val path: String = "/agent/session/delete"
+
+        data class Request(
+            val sessionId: String
+        )
+
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val req = ctx.receive<Request>()
+            val fa = try { fastAccess(ctx) } catch (e: FastAccessException) { return e.code }
+
+            var deleted = 0
+            fa.session.useDb { conn ->
+                // Recursive CTE: collect the root + all descendants
+                conn.prepareStatement(
+                    """
+                    WITH RECURSIVE descendants AS (
+                        SELECT session_id FROM agent_sessions WHERE session_id = ?::uuid
+                        UNION ALL
+                        SELECT s.session_id
+                        FROM agent_sessions s
+                        JOIN descendants d ON s.parent_session_id = d.session_id
+                    )
+                    DELETE FROM agent_sessions
+                    WHERE session_id IN (SELECT session_id FROM descendants)
+                    """.trimIndent()
+                ).use { ps ->
+                    ps.setString(1, req.sessionId)
+                    deleted = ps.executeUpdate()
+                }
+            }
+            return if (deleted > 0)
+                mapOf("deleted" to deleted)
+            else
+                HttpStatusCode.NotFound.description("Session not found")
+        }
+    }
+
+
     object SetSessionLifecycle : AbstractPostRoute() {
         override val path: String = "/agent/session/set_lifecycle"
 
@@ -1890,6 +1935,72 @@ object AgentOps {
                     if (!req.resultSha256.isNullOrBlank()) ps.setString(idx++, req.resultSha256)
                     if (!req.toolName.isNullOrBlank()) ps.setString(idx++, req.toolName)
                     if (!req.toolArgs.isNullOrBlank()) setJsonb(ps, idx++, req.toolArgs)
+                    ps.setInt(idx, safeLimit)
+
+                    val rs = ps.executeQuery()
+                    while (rs.next()) {
+                        results.add(mapOf(
+                            "resultUuid" to rs.getString("result_uuid"),
+                            "callId" to rs.getLong("call_id"),
+                            "sessionId" to rs.getString("session_id"),
+                            "messageId" to rs.getObject("message_id"),
+                            "toolCallId" to rs.getString("tool_call_id"),
+                            "toolName" to rs.getString("tool_name"),
+                            "toolArgs" to rs.getJsonb("tool_args"),
+                            "originalBytes" to rs.getInt("original_bytes"),
+                            "storedBytes" to rs.getInt("stored_bytes"),
+                            "truncated" to rs.getBoolean("truncated"),
+                            "sha256" to rs.getString("sha256"),
+                            "storagePolicy" to rs.getString("storage_policy"),
+                            "createdAt" to rs.getString("created_at")
+                        ))
+                    }
+                }
+            }
+            return results
+        }
+    }
+
+    /** Search tool call results by tool name, args text, or result UUID. */
+    object SearchToolCallResults : AbstractPostRoute() {
+        override val path: String = "/agent/tool_call/result/search"
+
+        data class Request(
+            val sessionId: String? = null,
+            val toolName: String? = null,
+            val toolArgsContains: String? = null,
+            val resultUuid: String? = null,
+            val limit: Int = 20
+        )
+
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val req = ctx.receive<Request>()
+            val fa = try { fastAccess(ctx) } catch (e: FastAccessException) { return e.code }
+            val safeLimit = req.limit.coerceIn(1, 100)
+            val results: MutableList<Map<String, Any?>> = mutableListOf()
+
+            fa.session.useDb { conn ->
+                val conditions = mutableListOf("1=1")
+                if (!req.sessionId.isNullOrBlank()) conditions.add("session_id = ?::uuid")
+                if (!req.toolName.isNullOrBlank()) conditions.add("tool_name = ?")
+                if (!req.toolArgsContains.isNullOrBlank()) conditions.add("tool_args::text ILIKE ?")
+                if (!req.resultUuid.isNullOrBlank()) conditions.add("result_uuid = ?::uuid")
+
+                val sql = """
+                    SELECT result_uuid, call_id, session_id, message_id, tool_call_id, tool_name, tool_args,
+                           original_bytes, stored_bytes, truncated, sha256, storage_policy, created_at
+                    FROM agent_tool_call_results
+                    WHERE ${conditions.joinToString(" AND ")}
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                """.trimIndent()
+
+                conn.prepareStatement(sql).use { ps ->
+                    var idx = 1
+                    if (!req.sessionId.isNullOrBlank()) ps.setString(idx++, req.sessionId)
+                    if (!req.toolName.isNullOrBlank()) ps.setString(idx++, req.toolName)
+                    if (!req.toolArgsContains.isNullOrBlank()) ps.setString(idx++, "%${req.toolArgsContains}%")
+                    if (!req.resultUuid.isNullOrBlank()) ps.setString(idx++, req.resultUuid)
                     ps.setInt(idx, safeLimit)
 
                     val rs = ps.executeQuery()

@@ -55,6 +55,7 @@ object RouteRegistry {
         AgentOps.GetSessionChildren,
         AgentOps.ListSessions,
         AgentOps.UpdateSession,
+        AgentOps.DeleteSession,
         AgentOps.SetSessionLifecycle,
         AgentOps.SetRuntimeState,
         AgentOps.GetRuntimeState,
@@ -85,6 +86,7 @@ object RouteRegistry {
 
         AgentOps.RecordToolCall,
         AgentOps.FindToolCallResults,
+        AgentOps.SearchToolCallResults,
         AgentOps.GetToolCallResult,
         AgentOps.AppendTranscript,
 
