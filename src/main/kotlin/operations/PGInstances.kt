@@ -100,8 +100,11 @@ object PGInstances {
                 else {
                     val removed = resourcesOwned.remove(resourceKey)
                     removed?.first?.timer?.get()?.cancel(false)
-                    // Release all sessions owned
-                    removed?.second?.tableSessions?.unlockAllOfOwner(owner)
+                    // Release all sessions owned and close the DB session
+                    removed?.second?.let { session ->
+                        session.tableSessions.unlockAllOfOwner(owner)
+                        session.close()
+                    }
                 }
             }
         }
@@ -117,7 +120,10 @@ object PGInstances {
         }
 
         override fun releaseHook(key: UUID, resource: Pair<ResourceData<String>, UserDatabaseSession?>, owner: String) {
-            resource.second?.tableSessions?.unlockAllOfOwner(owner)
+            resource.second?.let { session ->
+                session.tableSessions.unlockAllOfOwner(owner)
+                session.close()
+            }
         }
 
         fun unlockAllOfOwner(owner: String) {

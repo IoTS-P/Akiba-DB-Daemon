@@ -35,11 +35,12 @@ class UserDatabaseSession (val instanceName: String) {
             user = instanceMetadata.owner
             password = null
         }
-        dataSource.connection?.let { DatabaseDaemon.Companion.globalLogger.info("Local database connected") }
-            ?: run {
-                DatabaseDaemon.Companion.globalLogger.error("Local database connection failed: $instanceName")
-                throw SQLException("Database connection failed")
-            }
+        dataSource.connection.use { conn ->
+            DatabaseDaemon.Companion.globalLogger.info("Local database connected")
+        }
+        // If the connection above failed, PGSimpleDataSource throws
+        // rather than returning null, so we don't need the null-check
+        // branch.  The old code leaked the connection by not closing it.
 
         useDb { conn ->
             conn.createStatement().use {
@@ -80,6 +81,18 @@ class UserDatabaseSession (val instanceName: String) {
             }
         }
 
+        /** Unlock ALL table sessions regardless of owner. Used during
+         *  [UserDatabaseSession.close] to ensure no JDBC connections
+         *  outlive the session. */
+        fun unlockAll() {
+            val keysToUnlock = operationLock.withLock {
+                resourcesOwned.entries.map { it.key to it.value.first.owner }
+            }
+            keysToUnlock.forEach { (key, owner) ->
+                unlock(key, owner)
+            }
+        }
+
         fun renewAll() {
             val keysToRenew = operationLock.withLock {
                 resourcesOwned.keys.toList().map { key ->
@@ -104,6 +117,21 @@ class UserDatabaseSession (val instanceName: String) {
         }
         if (blocked)
             task.get()
+    }
+
+    /**
+     * Release all resources held by this session: shut down the
+     * single-thread executor and close all lingering table connections.
+     *
+     * Called from [PGInstances.UserSessionMap.unlock] and
+     * [releaseHook] when the session is removed (explicit disconnect
+     * or timeout).  Without this, every connect/disconnect cycle
+     * leaks an ExecutorService thread and potentially open JDBC
+     * connections, eventually hitting PostgreSQL's `max_connections`.
+     */
+    fun close() {
+        tableSessions.unlockAll()
+        dbScope.shutdownNow()
     }
 
     @Throws(SQLException::class)
