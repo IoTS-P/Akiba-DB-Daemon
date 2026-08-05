@@ -202,18 +202,26 @@ object Queries {
 
             val results: MutableList<Map<String, Any?>> = mutableListOf()
             val likePattern = "%$query%"
+            val numericId = query.toLongOrNull()
+            // A 32-char hex string is treated as an MD5 checksum and
+            // matched EXACTLY against u.checksum (used by modules to
+            // locate an already-imported binary after a duplicate
+            // import attempt).
+            val isMd5 = query.length == 32 &&
+                query.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' }
 
             fa.session.useDb { conn ->
                 val sql = buildString {
                     append("SELECT u.id, u.original_path, u.arch, u.format, u.compiler_spec, u.checksum ")
                     append("FROM using_binaries u ")
-                    // If query is a number, also match by exact id
-                    val conditions = if (query.toLongOrNull() != null) {
-                        "WHERE u.id = ? OR u.original_path ILIKE ? OR u.arch ILIKE ? OR u.format ILIKE ?"
-                    } else if (query.isNotEmpty()) {
-                        "WHERE u.original_path ILIKE ? OR u.arch ILIKE ? OR u.format ILIKE ?"
-                    } else {
-                        ""
+                    val conditions = when {
+                        numericId != null ->
+                            "WHERE u.id = ? OR u.original_path ILIKE ? OR u.arch ILIKE ? OR u.format ILIKE ?"
+                        isMd5 ->
+                            "WHERE u.checksum = ? OR u.original_path ILIKE ? OR u.arch ILIKE ? OR u.format ILIKE ?"
+                        query.isNotEmpty() ->
+                            "WHERE u.original_path ILIKE ? OR u.arch ILIKE ? OR u.format ILIKE ?"
+                        else -> ""
                     }
                     append(conditions)
                     append(" ORDER BY u.id LIMIT 50")
@@ -221,8 +229,10 @@ object Queries {
 
                 conn.prepareStatement(sql).use { stmt ->
                     var idx = 1
-                    if (query.toLongOrNull() != null) {
-                        stmt.setLong(idx++, query.toLong())
+                    if (numericId != null) {
+                        stmt.setLong(idx++, numericId)
+                    } else if (isMd5) {
+                        stmt.setString(idx++, query.lowercase())
                     }
                     if (query.isNotEmpty()) {
                         stmt.setObject(idx++, likePattern, java.sql.Types.VARCHAR)

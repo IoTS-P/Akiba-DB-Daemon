@@ -457,6 +457,69 @@ object AgentOps {
     }
 
 
+    /**
+     * Hard-delete every session tree rooted at a session whose
+     * `project_name` matches the given project.
+     *
+     * Why a recursive CTE instead of a plain `WHERE project_name =
+     * ?`: child sessions spawned via `spawn_sub_agent` /
+     * `spawnChildFromAgentProgrammatically` do NOT inherit the
+     * parent's `project_name` (their column is NULL), so a plain
+     * column match would delete only the roots and leave the
+     * children behind as orphans.  The CTE starts at every
+     * project-matching session and walks `parent_session_id`
+     * downwards, collecting the whole tree regardless of the
+     * children's own `project_name` values — mirroring
+     * [DeleteSession]'s single-root recursion.
+     *
+     * All rows are deleted in one SQL statement; the CASCADE FK
+     * constraints on dependent tables (agent_messages,
+     * agent_tool_calls, agent_graphs, etc.) ensure a clean removal.
+     *
+     * Used by the Projects page "delete project" flow when the user
+     * opts into removing the project's agent sessions as well.
+     */
+    object DeleteSessionsByProject : AbstractPostRoute() {
+        override val path: String = "/agent/session/delete-by-project"
+
+        data class Request(
+            val projectName: String
+        )
+
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val req = ctx.receive<Request>()
+            if (req.projectName.isBlank()) {
+                return HttpStatusCode.BadRequest.description("projectName is required")
+            }
+            val fa = try { fastAccess(ctx) } catch (e: FastAccessException) { return e.code }
+
+            var deleted = 0
+            fa.session.useDb { conn ->
+                // Recursive CTE: every project-matching session plus
+                // all of their descendants (children may have a NULL
+                // project_name of their own).
+                conn.prepareStatement(
+                    """
+                    WITH RECURSIVE tree AS (
+                        SELECT session_id FROM agent_sessions WHERE project_name = ?
+                        UNION ALL
+                        SELECT s.session_id
+                        FROM agent_sessions s
+                        JOIN tree t ON s.parent_session_id = t.session_id
+                    )
+                    DELETE FROM agent_sessions
+                    WHERE session_id IN (SELECT session_id FROM tree)
+                    """.trimIndent()
+                ).use { ps ->
+                    ps.setString(1, req.projectName)
+                    deleted = ps.executeUpdate()
+                }
+            }
+            return mapOf("deleted" to deleted)
+        }
+    }
+
+
     object SetSessionLifecycle : AbstractPostRoute() {
         override val path: String = "/agent/session/set_lifecycle"
 
@@ -614,7 +677,7 @@ object AgentOps {
 
             val results: MutableList<Map<String, Any?>> = mutableListOf()
             fa.session.useDb { conn ->
-                val filter = if (req.includeClosed) "" else "AND runtime_state <> 'closed'"
+                val filter = if (req.includeClosed) "" else "AND runtime_state NOT IN ('closed', 'error')"
                 val sql = """
                     WITH RECURSIVE subtree AS (
                         SELECT session_id, parent_session_id, runtime_state, closing_reason,

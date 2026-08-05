@@ -56,6 +56,7 @@ object RouteRegistry {
         AgentOps.ListSessions,
         AgentOps.UpdateSession,
         AgentOps.DeleteSession,
+        AgentOps.DeleteSessionsByProject,
         AgentOps.SetSessionLifecycle,
         AgentOps.SetRuntimeState,
         AgentOps.GetRuntimeState,
