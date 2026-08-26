@@ -61,8 +61,13 @@ class DatabaseDaemon : Runnable {
         PGInstances.initialize()
         DbDaemonServer.startServer()
 
-        // hang
-        while (true) {}
+        // Keep the main thread alive without burning a core.  Requests are
+        // served on Netty event-loop threads, so main can park indefinitely.
+        // Shutdown is driven by the signal handler calling exitProcess, so
+        // this latch is intentionally never counted down.  (The previous
+        // `while (true) {}` busy-spin pinned one core at 100% for the whole
+        // lifetime of the process.)
+        java.util.concurrent.CountDownLatch(1).await()
     }
 
     private fun parseConfig(): Configs {

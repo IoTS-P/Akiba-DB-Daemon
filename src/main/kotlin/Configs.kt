@@ -13,6 +13,13 @@ data class Configs (
     // If the server didn't receive a response from a client within this time, it will release the token
     val maxTokenWaitingTime: Int = 7200,
 
+    // Maximum time a single database operation may block its caller
+    // (seconds), default 2 minutes.  Guards against a wedged per-session
+    // DB worker (stuck query, or a task orphaned when the session is
+    // closed mid-flight) parking the calling Netty event-loop thread
+    // forever — which previously wedged the whole daemon.
+    val dbOperationTimeoutSeconds: Int = 120,
+
     // Postgres bin directory, the directory that contains pg_basebackup, pg_dump, pg_restore, etc
     val pgBinDirectory: String = "/usr/bin",
     // Backup directory

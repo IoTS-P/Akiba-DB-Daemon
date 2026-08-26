@@ -57,16 +57,6 @@ SELECT assert_column_type('public', 'binaries', 'compiler_spec', 'text');
 SELECT assert_column_type('public', 'binaries', 'source_id', 'int4');
 SELECT assert_column_type('public', 'binaries', 'source_module', 'text');
 
--- Backwards-compatible upgrade: add the two columns to a pre-existing
--- `binaries` table that was created before these columns were introduced.
-ALTER TABLE binaries
-    ADD COLUMN IF NOT EXISTS source_id INTEGER REFERENCES binaries (id)
-        ON DELETE SET NULL
-        ON UPDATE CASCADE;
-ALTER TABLE binaries
-    ADD COLUMN IF NOT EXISTS source_module TEXT;
-
-
 -- Some binaries are processed when imported and may generate new files, so we need to save them
 -- Note: Not all binaries are processed, so this table doesn't contain all ids
 CREATE TABLE IF NOT EXISTS processed_binaries (

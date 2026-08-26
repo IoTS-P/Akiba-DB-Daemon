@@ -10,6 +10,8 @@ import java.sql.SQLException
 import java.time.Duration
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import kotlin.concurrent.withLock
 import kotlin.use
 
@@ -115,8 +117,32 @@ class UserDatabaseSession (val instanceName: String) {
                 doing(conn)
             }
         }
-        if (blocked)
-            task.get()
+        if (blocked) {
+            try {
+                task.get(
+                    DatabaseDaemon.Companion.config.dbOperationTimeoutSeconds.toLong(),
+                    TimeUnit.SECONDS
+                )
+            } catch (e: TimeoutException) {
+                // The session's single DB worker is wedged (stuck query),
+                // or this task was orphaned when the session was closed
+                // mid-flight: `shutdownNow()` never completes the futures
+                // of tasks still sitting in the queue, so an unbounded
+                // `task.get()` would park the caller — typically a Netty
+                // event-loop thread — forever and gradually wedge the
+                // whole daemon.  Fail fast instead.
+                task.cancel(true)
+                throw SQLException(
+                    "Database operation did not complete within " +
+                        "${DatabaseDaemon.Companion.config.dbOperationTimeoutSeconds}s " +
+                        "(session '$instanceName'); the DB worker may be wedged", e)
+            } catch (e: InterruptedException) {
+                task.cancel(true)
+                Thread.currentThread().interrupt()
+                throw SQLException(
+                    "Interrupted while waiting for database operation (session '$instanceName')", e)
+            }
+        }
     }
 
     /**
@@ -131,7 +157,15 @@ class UserDatabaseSession (val instanceName: String) {
      */
     fun close() {
         tableSessions.unlockAll()
-        dbScope.shutdownNow()
+        val orphaned = dbScope.shutdownNow()
+        if (orphaned.isNotEmpty()) {
+            // These queued tasks will never run and their futures never
+            // complete; callers waiting on them are released by the
+            // useDb timeout above.  Log so the wedge is diagnosable.
+            DatabaseDaemon.Companion.globalLogger.warn(
+                "Closing DB session '$instanceName' with ${orphaned.size} queued " +
+                    "task(s) that will never execute (session closed with requests in flight)")
+        }
     }
 
     @Throws(SQLException::class)

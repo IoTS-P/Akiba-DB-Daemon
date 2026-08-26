@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
     graph_id          UUID,                          -- FK → agent_graphs (set after graph is bound)
     model_name        TEXT,                          -- e.g. "gpt-4o", "claude-3-sonnet"
     project_name      TEXT,                          -- Ghidra project bound to this interactive/automated session
+    workflow_id       TEXT,                          -- workflow run that spawned this session (null for interactive sessions); children inherit it from their parent
     parent_session_id UUID                           -- self-reference; null for root sessions
                           REFERENCES agent_sessions(session_id)
                           ON DELETE SET NULL
@@ -67,6 +68,7 @@ SELECT assert_column_type('public', 'agent_sessions', 'module_name',       'text
 SELECT assert_column_type('public', 'agent_sessions', 'graph_id',          'uuid');
 SELECT assert_column_type('public', 'agent_sessions', 'model_name',        'text');
 SELECT assert_column_type('public', 'agent_sessions', 'project_name',      'text');
+SELECT assert_column_type('public', 'agent_sessions', 'workflow_id',       'text');
 SELECT assert_column_type('public', 'agent_sessions', 'parent_session_id', 'uuid');
 SELECT assert_column_type('public', 'agent_sessions', 'lifecycle',         'text');
 SELECT assert_column_type('public', 'agent_sessions', 'runtime_state',     'text');
@@ -78,6 +80,7 @@ SELECT assert_column_type('public', 'agent_sessions', 'completed_at',      'time
 SELECT assert_column_type('public', 'agent_sessions', 'transcript',        'text');
 
 CREATE INDEX IF NOT EXISTS idx_agent_sessions_status            ON agent_sessions(status);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_workflow_id        ON agent_sessions(workflow_id) WHERE workflow_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_agent_sessions_binary_id         ON agent_sessions(binary_id);
 CREATE INDEX IF NOT EXISTS idx_agent_sessions_module            ON agent_sessions(module_name);
 CREATE INDEX IF NOT EXISTS idx_agent_sessions_parent_session    ON agent_sessions(parent_session_id);

@@ -260,6 +260,61 @@ object Queries {
     }
 
     /**
+     * Delete binaries by id list.
+     *
+     * Accepts `{ "ids": [1, 2, ...] }`.  Ids are bound through a
+     * parameterized `ANY(?)` array — no SQL injection risk.
+     *
+     * Deleting from `binaries` cascades to `processed_binaries` and
+     * `results` (both reference `binaries.id` with ON DELETE CASCADE)
+     * and resets child rows' `source_id` to NULL (ON DELETE SET NULL),
+     * so one statement cleans every FK-linked row in this database.
+     * Module-owned result tables and the agent database are NOT touched
+     * (they are outside the FK graph).
+     *
+     * Returns the ids that were actually deleted (unknown ids are
+     * silently skipped).  At most 500 ids per call.
+     */
+    object DeleteBinaries : AbstractPostRoute() {
+        override val path: String = "/delete/binaries"
+
+        const val MAX_IDS_PER_CALL: Int = 500
+
+        @Throws(SQLException::class)
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val data = ctx.receive<Map<String, List<Long>>>()
+            val ids = data["ids"]?.filter { it > 0 }?.distinct().orEmpty()
+            if (ids.isEmpty())
+                return HttpStatusCode.BadRequest.description("No binary ids provided")
+            if (ids.size > MAX_IDS_PER_CALL)
+                return HttpStatusCode.BadRequest.description(
+                    "Too many ids (max $MAX_IDS_PER_CALL per call)")
+
+            val fa = try {
+                fastAccess(ctx)
+            } catch (e: FastAccessException) {
+                return e.code
+            }
+
+            val deleted: MutableList<Long> = mutableListOf()
+            fa.session.useDb { conn ->
+                conn.prepareStatement(
+                    "DELETE FROM binaries WHERE id = ANY(?) RETURNING id"
+                ).use { stmt ->
+                    stmt.setArray(1, conn.createArrayOf("int4", ids.toTypedArray()))
+                    val rs = stmt.executeQuery()
+                    while (rs.next())
+                        deleted.add(rs.getLong("id"))
+                }
+            }
+            globalLogger.info(
+                "DeleteBinaries: requested {}, deleted {} ({})",
+                ids.size, deleted.size, deleted)
+            return deleted
+        }
+    }
+
+    /**
      * Get module data from module table
      *
      * Data format:

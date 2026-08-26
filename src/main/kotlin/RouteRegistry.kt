@@ -24,6 +24,7 @@ object RouteRegistry {
         Queries.SearchBinaries,
         Queries.GetModuleData,
         Queries.SelectIdInSQL,
+        Queries.DeleteBinaries,
 
         Insertions.MD5Exists,
         Insertions.InsertBinary,
@@ -54,6 +55,7 @@ object RouteRegistry {
         AgentOps.GetSession,
         AgentOps.GetSessionChildren,
         AgentOps.ListSessions,
+        AgentOps.SearchSessions,
         AgentOps.UpdateSession,
         AgentOps.DeleteSession,
         AgentOps.DeleteSessionsByProject,

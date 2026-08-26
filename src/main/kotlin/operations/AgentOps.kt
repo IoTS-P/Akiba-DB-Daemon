@@ -7,6 +7,7 @@ import org.iotsplab.akiba.dbDaemon.RouteContext
 import org.iotsplab.akiba.dbDaemon.dbutil.defaultDbTypeAdapters
 import org.postgresql.util.PGobject
 import java.sql.ResultSet
+import java.sql.SQLException
 import java.util.UUID
 
 /**
@@ -81,6 +82,12 @@ object AgentOps {
             val modelName: String? = null,
             val projectName: String? = null,
             /**
+             * Optional workflow run id that spawned this session.  When
+             * null but [parentSessionId] is given, the child inherits the
+             * parent's workflow_id automatically.
+             */
+            val workflowId: String? = null,
+            /**
              * Optional UUID of the parent session. Used by `spawn_sub_agent`
              * to attach the spawned child to the parent's tree.
              */
@@ -115,8 +122,13 @@ object AgentOps {
                 conn.prepareStatement(
                     """
                     INSERT INTO agent_sessions
-                        (session_name, binary_id, module_name, model_name, project_name, parent_session_id)
-                    VALUES (?, ?, ?, ?, ?, ?::uuid)
+                        (session_name, binary_id, module_name, model_name, project_name, workflow_id, parent_session_id)
+                    VALUES (?, ?, ?, ?, ?,
+                            -- A child session inherits its parent's workflow
+                            -- unless an explicit workflowId was supplied.
+                            COALESCE(?, (SELECT workflow_id FROM agent_sessions
+                                         WHERE session_id = ?::uuid)),
+                            ?::uuid)
                     RETURNING session_id
                     """.trimIndent()
                 ).use { ps ->
@@ -125,8 +137,11 @@ object AgentOps {
                     ps.setString(3, req.moduleName)
                     ps.setString(4, req.modelName)
                     ps.setString(5, req.projectName)
-                    if (req.parentSessionId != null) ps.setString(6, req.parentSessionId)
-                    else ps.setNull(6, java.sql.Types.OTHER)
+                    ps.setString(6, req.workflowId)
+                    if (req.parentSessionId != null) ps.setString(7, req.parentSessionId)
+                    else ps.setNull(7, java.sql.Types.OTHER)
+                    if (req.parentSessionId != null) ps.setString(8, req.parentSessionId)
+                    else ps.setNull(8, java.sql.Types.OTHER)
                     val rs = ps.executeQuery()
                     if (rs.next()) sessionId = rs.getUUIDStr("session_id")
                 }
@@ -148,7 +163,7 @@ object AgentOps {
             fa.session.useDb { conn ->
                 conn.prepareStatement(
                     "SELECT session_id, session_name, status, binary_id, module_name, graph_id, " +
-                    "model_name, project_name, created_at, updated_at, resumed_at, completed_at, transcript, " +
+                    "model_name, project_name, workflow_id, created_at, updated_at, resumed_at, completed_at, transcript, " +
                     "parent_session_id, lifecycle, runtime_state, closing_reason " +
                     "FROM agent_sessions WHERE session_id = ?::uuid"
                 ).use { ps ->
@@ -163,6 +178,8 @@ object AgentOps {
                             "moduleName" to rs.getString("module_name"),
                             "graphId" to rs.getUUIDStr("graph_id"),
                             "modelName" to rs.getString("model_name"),
+                            "projectName" to rs.getString("project_name"),
+                            "workflowId" to rs.getString("workflow_id"),
                             "createdAt" to rs.getString("created_at"),
                             "updatedAt" to rs.getString("updated_at"),
                             "resumedAt" to rs.getString("resumed_at"),
@@ -197,7 +214,7 @@ object AgentOps {
             fa.session.useDb { conn ->
                 val sql = """
                     SELECT session_id, session_name, status, runtime_state, binary_id, module_name,
-                           model_name, project_name, created_at, updated_at, parent_session_id
+                           model_name, project_name, workflow_id, created_at, updated_at, parent_session_id
                     FROM agent_sessions
                     WHERE parent_session_id = ?::uuid
                     ORDER BY created_at ASC
@@ -216,6 +233,7 @@ object AgentOps {
                             "moduleName" to rs.getString("module_name"),
                             "modelName" to rs.getString("model_name"),
                             "projectName" to rs.getString("project_name"),
+                            "workflowId" to rs.getString("workflow_id"),
                             "createdAt" to rs.getString("created_at"),
                             "updatedAt" to rs.getString("updated_at"),
                             "parentSessionId" to rs.getUUIDStr("parent_session_id")
@@ -235,6 +253,7 @@ object AgentOps {
             val status: String? = null,
             val binaryId: Int? = null,
             val moduleName: String? = null,
+            val workflowId: String? = null,
             val limit: Int = 50,
             val offset: Int = 0,
             /**
@@ -280,6 +299,10 @@ object AgentOps {
                     conditions.add("module_name = ?")
                     params.add(it)
                 }
+                req.workflowId?.let {
+                    conditions.add("workflow_id = ?")
+                    params.add(it)
+                }
                 when (val pid = req.parentSessionId) {
                     null -> {
                         // Default: only top-level sessions
@@ -296,7 +319,7 @@ object AgentOps {
 
                 val where = if (conditions.isEmpty()) "" else "WHERE ${conditions.joinToString(" AND ")}"
                 val sql = "SELECT session_id, session_name, status, runtime_state, binary_id, module_name, " +
-                    "model_name, project_name, created_at, updated_at, parent_session_id " +
+                    "model_name, project_name, workflow_id, created_at, updated_at, parent_session_id " +
                     "FROM agent_sessions $where " +
                     "ORDER BY updated_at DESC LIMIT ? OFFSET ?"
 
@@ -325,6 +348,97 @@ object AgentOps {
                             "moduleName" to rs.getString("module_name"),
                             "modelName" to rs.getString("model_name"),
                             "projectName" to rs.getString("project_name"),
+                            "workflowId" to rs.getString("workflow_id"),
+                            "createdAt" to rs.getString("created_at"),
+                            "updatedAt" to rs.getString("updated_at"),
+                            "parentSessionId" to rs.getUUIDStr("parent_session_id")
+                        ))
+                    }
+                }
+            }
+            return results
+        }
+    }
+
+    /**
+     * Search sessions by title and message content.
+     *
+     * Accepts `{ "query": "...", "limit": 50 }`.  A top-level session is
+     * returned when ANY session in its subtree matches either
+     *  - `agent_sessions.session_name ILIKE %query%`, or
+     *  - `agent_messages.content ILIKE %query%` (message bodies).
+     *
+     * Only TOP-LEVEL sessions are returned: when a sub-agent matches,
+     * its root session is reported instead, because the frontend list is
+     * a top-level tree.  LIKE metacharacters in the query are escaped so
+     * the match is literal; all values are bound parameters (Rule 1).
+     *
+     * Note: content matching seq-scans `agent_messages`, which is
+     * acceptable for an on-demand admin search but should not be polled.
+     */
+    object SearchSessions : AbstractPostRoute() {
+        override val path: String = "/agent/session/search"
+
+        data class Request(val query: String = "", val limit: Int = 50)
+
+        @Throws(SQLException::class)
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val req = ctx.receive<Request>()
+            val q = req.query.trim()
+            if (q.length < 2)
+                return HttpStatusCode.BadRequest.description("Query too short (min 2 characters)")
+            val limit = req.limit.coerceIn(1, 200)
+            val fa = try { fastAccess(ctx) } catch (e: FastAccessException) { return e.code }
+
+            // Escape LIKE metacharacters so the query matches literally.
+            val like = "%" + q
+                .replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_") + "%"
+
+            val results: MutableList<Map<String, Any?>> = mutableListOf()
+            fa.session.useDb { conn ->
+                val sql = """
+                    WITH RECURSIVE roots AS (
+                        SELECT session_id, session_id AS root_id
+                        FROM agent_sessions WHERE parent_session_id IS NULL
+                        UNION ALL
+                        SELECT s.session_id, r.root_id
+                        FROM agent_sessions s
+                        JOIN roots r ON s.parent_session_id = r.session_id
+                    ), matches AS (
+                        SELECT DISTINCT r.root_id
+                        FROM roots r JOIN agent_sessions s ON s.session_id = r.session_id
+                        WHERE s.session_name ILIKE ? ESCAPE '\'
+                        UNION
+                        SELECT DISTINCT r.root_id
+                        FROM roots r JOIN agent_messages m ON m.session_id = r.session_id
+                        WHERE m.content ILIKE ? ESCAPE '\'
+                    )
+                    SELECT s.session_id, s.session_name, s.status, s.runtime_state, s.binary_id,
+                           s.module_name, s.model_name, s.project_name, s.workflow_id,
+                           s.created_at, s.updated_at, s.parent_session_id
+                    FROM agent_sessions s JOIN matches m ON s.session_id = m.root_id
+                    ORDER BY s.updated_at DESC
+                    LIMIT ?
+                """.trimIndent()
+                conn.prepareStatement(sql).use { ps ->
+                    ps.setString(1, like)
+                    ps.setString(2, like)
+                    ps.setInt(3, limit)
+                    val rs = ps.executeQuery()
+                    while (rs.next()) {
+                        val runtimeState = rs.sessionRuntimeState()
+                        results.add(mapOf(
+                            "sessionId" to rs.getUUIDStr("session_id"),
+                            "sessionName" to rs.getString("session_name"),
+                            "status" to runtimeState,
+                            "runtimeState" to runtimeState,
+                            "binaryId" to rs.getObject("binary_id"),
+                            "moduleName" to rs.getString("module_name"),
+                            "modelName" to rs.getString("model_name"),
+                            "projectName" to rs.getString("project_name"),
+                            "workflowId" to rs.getString("workflow_id"),
                             "createdAt" to rs.getString("created_at"),
                             "updatedAt" to rs.getString("updated_at"),
                             "parentSessionId" to rs.getUUIDStr("parent_session_id")
@@ -1047,10 +1161,11 @@ object AgentOps {
                     return HttpStatusCode.BadRequest.description("Invalid role: ${msg.role}")
             }
 
-            val ids: MutableList<Long> = mutableListOf()
+            // Hoisted so the assigned message_index values can be returned
+            // to the caller after the insert (see the return below).
+            var maxIndex = 0
             fa.session.useDb { conn ->
                 // Get the current max message_index for this session
-                var maxIndex = 0
                 conn.prepareStatement(
                     "SELECT COALESCE(MAX(message_index), 0) FROM agent_messages WHERE session_id = ?::uuid"
                 ).use { ps ->
@@ -1063,10 +1178,9 @@ object AgentOps {
                     INSERT INTO agent_messages
                     (session_id, message_index, role, content, tool_call_id, tool_name, tool_call_args, tool_result, token_count, input_token_count)
                     VALUES (?::uuid, ?, ?, ?, ?, ?, ?::jsonb, ?, ?, ?)
-                    RETURNING message_id
                 """.trimIndent()
 
-                conn.prepareStatement(insertSql, java.sql.Statement.RETURN_GENERATED_KEYS).use { ps ->
+                conn.prepareStatement(insertSql).use { ps ->
                     for ((i, msg) in req.messages.withIndex()) {
                         ps.setString(1, req.sessionId)
                         ps.setInt(2, maxIndex + i + 1)
@@ -1080,10 +1194,7 @@ object AgentOps {
                         if (msg.inputTokenCount != null) ps.setInt(10, msg.inputTokenCount) else ps.setNull(10, java.sql.Types.INTEGER)
                         ps.addBatch()
                     }
-                    // Execute batch and collect generated keys
                     ps.executeBatch()
-                    val rs = ps.generatedKeys
-                    while (rs.next()) ids.add(rs.getLong("message_id"))
                 }
             }
 
@@ -1097,7 +1208,14 @@ object AgentOps {
                 }
             }
 
-            return ids
+            // Return the assigned message_index values (NOT message_ids).
+            // PersistentChatMemory stamps its in-memory buffer with these
+            // so removeLast() targets the correct DB row even when rows
+            // written outside the chat-memory track (llm-progress
+            // heartbeats/previews, retry markers) have inflated the real
+            // indexes — that drift previously made removeLast() delete
+            // extra rows of genuine transcript history.
+            return req.messages.indices.map { maxIndex + it + 1 }
         }
     }
 
