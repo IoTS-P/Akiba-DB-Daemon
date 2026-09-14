@@ -43,12 +43,15 @@ dependencies {
 
     // PostgreSQL
     implementation("org.postgresql:postgresql:42.7.10")
+
+    // Password hashing for the daemon credential store. Same library the
+    // framework's user table uses, so both sides hash identically.
+    implementation("org.mindrot:jbcrypt:0.4")
 }
 
 tasks.distZip {
     into("akiba_db_daemon-$version/resources") {
         from("src/main/resources/initialize_pg_instance.sh") { fileMode = 0b111_101_101 } // 0755
-        from("src/main/resources/initialize_pg_local.sh")    { fileMode = 0b111_101_101 } // 0755
         from("src/main/resources/database_init.sql")
         from("src/main/resources/agent_database_init.sql")
         from("src/main/resources/backup_db_init.sql")

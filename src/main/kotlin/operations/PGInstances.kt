@@ -4,6 +4,7 @@ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
+import io.ktor.server.plugins.origin
 import io.ktor.server.request.header
 import io.ktor.server.websocket.DefaultWebSocketServerSession
 import io.ktor.server.websocket.receiveDeserialized
@@ -14,6 +15,7 @@ import io.ktor.websocket.close
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.ReceiveChannel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -24,6 +26,7 @@ import org.iotsplab.akiba.dbDaemon.DatabaseDaemon.Companion.config
 import org.iotsplab.akiba.dbDaemon.DatabaseDaemon.Companion.globalLogger
 import org.iotsplab.akiba.dbDaemon.RouteContext
 import org.iotsplab.akiba.dbDaemon.dbutil.UserDatabaseSession
+import org.iotsplab.akiba.dbDaemon.dbutil.UserStore
 import org.iotsplab.akiba.dbDaemon.operations.PGInstances.CreateInstance.createLock
 import org.iotsplab.akiba.dbDaemon.token.ResourceData
 import org.iotsplab.akiba.dbDaemon.token.TimedResourceMap
@@ -326,15 +329,297 @@ object PGInstances {
 
         data class AuthData (
             val username: String,
-            val password: String
+            val password: String = ""
         )
 
-        // TODO: Add authentications
+        /**
+         * Verify the supplied credentials against [UserStore] and, on success,
+         * issue the session token that every other route authenticates with.
+         *
+         * Two outcomes deserve a note:
+         *
+         *  - **Bootstrap.** When the credential store holds no users at all
+         *    (fresh deployment, or a pre-existing deployment that upgraded to a
+         *    version with authentication), the first login *registers* the
+         *    supplied username + password and marks it as the administrator.
+         *    Without this, existing deployments would be locked out of their own
+         *    instance data, which is owned by that username.
+         *  - **Failure modes are deliberately indistinguishable.** An unknown
+         *    username and a wrong password both return 401 with the same
+         *    message, so the daemon does not confirm which usernames exist.
+         *
+         * Brute-force protection is the third: a rejected login is answered only
+         * after [UserStore.LOGIN_FAILURE_DELAY], and
+         * [UserStore.MAX_LOGIN_FAILED_ATTEMPTS] failures inside a day lock the
+         * account for a day. That policy is skipped for callers on the loopback
+         * interface — the co-located Akiba server, which relays credentials a
+         * human already entered at the web login and is not an attacker. Without
+         * the exemption, anyone able to reach this port could lock an account
+         * here and thereby cut the deployment off from its own daemon.
+         */
         override suspend fun handle(ctx: RouteContext): Any? {
             val authData = ctx.receive<AuthData>()
-            val token = UUID.randomUUID()
-            tokens[token] = authData.username
-            return mapOf("token" to token)
+            val username = authData.username.trim()
+            if (username.isEmpty())
+                return HttpStatusCode.BadRequest.description("Username must not be empty")
+
+            val peer = ctx.call.request.origin.remoteHost
+            val trustedPeer = peer == "127.0.0.1" || peer == "::1" || peer == "localhost"
+
+            return when (val verdict = UserStore.login(username, authData.password, enforceLock = !trustedPeer)) {
+                UserStore.LoginResult.BadCredentials -> {
+                    // Hold the answer back so the endpoint is not a fast oracle for
+                    // guessing passwords (mirrors the framework's web login).
+                    delay(UserStore.LOGIN_FAILURE_DELAY.toMillis())
+                    HttpStatusCode.Unauthorized.description("Invalid username or password")
+                }
+
+                is UserStore.LoginResult.Locked -> {
+                    delay(UserStore.LOGIN_FAILURE_DELAY.toMillis())
+                    globalLogger.warn("Rejected login for locked daemon account '$username'")
+                    HttpStatusCode.Locked.description(
+                        "Account locked after too many failed sign-ins. It unlocks at " +
+                            "${verdict.until}, or an administrator can unlock it."
+                    )
+                }
+
+                is UserStore.LoginResult.StoreUnavailable ->
+                    HttpStatusCode.InternalServerError.description(
+                        "Credential store unavailable: ${verdict.reason}")
+
+                UserStore.LoginResult.Success, UserStore.LoginResult.Bootstrapped -> {
+                    val token = UUID.randomUUID()
+                    tokens[token] = username
+                    val bootstrapped = verdict === UserStore.LoginResult.Bootstrapped
+                    if (bootstrapped) {
+                        globalLogger.warn(
+                            "Credential store was empty: '$username' has been registered as the " +
+                                "first administrator of this daemon. Later logins must match this " +
+                                "password.")
+                    }
+                    mapOf(
+                        "token" to token,
+                        "username" to username,
+                        "isAdmin" to UserStore.isAdmin(username),
+                        "bootstrapped" to bootstrapped,
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * Register an additional credential.
+     *
+     * Creating further users requires an administrator token (the first user
+     * never does — see [UserStore.register]). The framework's HTTP server calls
+     * this when an administrator creates a web account, so that the web login
+     * and the daemon credential stay in sync.
+     */
+    object ClientRegister: AbstractPostRoute() {
+        override val path: String = "/instance/register"
+
+        data class RegisterData (
+            val username: String,
+            val password: String = "",
+            val isAdmin: Boolean = false,
+        )
+
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val data = ctx.receive<RegisterData>()
+            val requester = ctx.call.request.header(HttpHeaders.Authorization)
+                ?.let { raw -> runCatching { UUID.fromString(raw) }.getOrNull() }
+                ?.let { tokens[it] }
+            val authorized = requester != null && UserStore.isAdmin(requester)
+
+            return when (UserStore.register(
+                data.username, data.password, data.isAdmin, authorized
+            )) {
+                UserStore.RegisterResult.Created ->
+                    mapOf(
+                        "username" to data.username.trim(),
+                        "isAdmin" to UserStore.isAdmin(data.username.trim()),
+                    )
+                UserStore.RegisterResult.AlreadyExists ->
+                    HttpStatusCode.Conflict.description(
+                        "User '${data.username.trim()}' already exists")
+                UserStore.RegisterResult.InvalidName ->
+                    HttpStatusCode.BadRequest.description(
+                        "Invalid username: expected ${UserStore.USERNAME_PATTERN}")
+                UserStore.RegisterResult.WeakPassword ->
+                    HttpStatusCode.BadRequest.description(
+                        "Password must be at least ${UserStore.MIN_PASSWORD_LENGTH} characters")
+                UserStore.RegisterResult.NotAuthorized ->
+                    HttpStatusCode.Unauthorized.description(
+                        "Only an administrator may create new users")
+                UserStore.RegisterResult.StoreUnavailable ->
+                    HttpStatusCode.InternalServerError.description(
+                        "Credential store unavailable")
+            }
+        }
+    }
+
+    /**
+     * List the instances owned by the caller.
+     *
+     * The daemon historically had no way to enumerate instances, which forced
+     * the frontend to remember names in `localStorage` and probe them one by
+     * one. Now that instances are namespaced by the authenticated user, the
+     * daemon can answer the question the UI actually asks: "which instances
+     * does *this* user have?".
+     */
+    object ListInstances: AbstractPostRoute() {
+        override val path: String = "/instance/list"
+
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val token = ctx.call.request.header(HttpHeaders.Authorization)
+                ?.let { raw -> runCatching { UUID.fromString(raw) }.getOrNull() }
+                ?: return HttpStatusCode.Unauthorized.description("No authorization token provided")
+            val user = tokens[token]
+                ?: return HttpStatusCode.BadRequest.description("Token $token not found")
+
+            val owned = instances.entries
+                .filter { it.value.owner == user }
+                .map { (name, meta) ->
+                    mapOf(
+                        "name" to name,
+                        "port" to meta.port,
+                        "logicalPrior" to meta.logicalPrior,
+                        "running" to instanceIsOn(name),
+                    )
+                }
+
+            return mapOf(
+                "username" to user,
+                "isAdmin" to UserStore.isAdmin(user),
+                "instances" to owned,
+            )
+        }
+    }
+
+    /**
+     * Mint a derived credential for the caller's own identity.
+     *
+     * The framework's HTTP server spawns child JVMs (workflow runs, manual agent
+     * workers) that talk to the daemon on their own. Those children must present
+     * the *owner's* identity, because `/instance/connect` checks ownership — so
+     * the parent asks for a derived secret here instead of copying the account
+     * password into the generated config file.
+     */
+    object WorkerGrant: AbstractPostRoute() {
+        override val path: String = "/instance/worker-grant"
+
+        /** Default lifetime of a derived credential: 12 hours. */
+        const val DEFAULT_TTL_SECONDS: Long = 12 * 3600
+        const val MAX_TTL_SECONDS: Long = 30L * 24 * 3600
+
+        data class GrantRequest(
+            val label: String = "worker",
+            val ttlSeconds: Long = DEFAULT_TTL_SECONDS,
+        )
+
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val token = ctx.call.request.header(HttpHeaders.Authorization)
+                ?.let { raw -> runCatching { UUID.fromString(raw) }.getOrNull() }
+                ?: return HttpStatusCode.Unauthorized.description("No authorization token provided")
+            val user = tokens[token]
+                ?: return HttpStatusCode.BadRequest.description("Token $token not found")
+
+            val req = ctx.receive<GrantRequest>()
+            val ttl = req.ttlSeconds.coerceIn(60L, MAX_TTL_SECONDS)
+            val secret = UserStore.grantDerived(user, req.label, ttl)
+                ?: return HttpStatusCode.InternalServerError.description(
+                    "No credential record for '$user'")
+
+            return mapOf(
+                "username" to user,
+                "secret" to secret,
+                "expiresInSeconds" to ttl,
+            )
+        }
+    }
+
+    /**
+     * Change another user's password.
+     *
+     * The framework mirrors every account into this credential store, so a
+     * password change on the web side has to be applied here too — otherwise the
+     * account can sign in but every instance operation is rejected. Only an
+     * administrator token may call this.
+     */
+    object SetPassword: AbstractPostRoute() {
+        override val path: String = "/instance/set-password"
+
+        data class SetPasswordData (
+            val username: String,
+            val password: String = "",
+        )
+
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val requester = ctx.call.request.header(HttpHeaders.Authorization)
+                ?.let { raw -> runCatching { UUID.fromString(raw) }.getOrNull() }
+                ?.let { tokens[it] }
+                ?: return HttpStatusCode.Unauthorized.description(
+                    "No authorization token provided")
+
+            if (!UserStore.isAdmin(requester))
+                return HttpStatusCode.Unauthorized.description(
+                    "Only an administrator may change another user's password")
+
+            val data = ctx.receive<SetPasswordData>()
+            if (data.password.length < UserStore.MIN_PASSWORD_LENGTH)
+                return HttpStatusCode.BadRequest.description(
+                    "Password must be at least ${UserStore.MIN_PASSWORD_LENGTH} characters")
+
+            val name = data.username.trim()
+            if (!UserStore.hasUser(name))
+                return HttpStatusCode.NotFound.description("User '$name' not found")
+
+            globalLogger.warn("Administrator '$requester' changed the password of '$name'")
+            return if (UserStore.setPassword(name, data.password))
+                mapOf("username" to name, "message" to "Password updated")
+            else
+                HttpStatusCode.InternalServerError.description(
+                    "Failed to update the credential of '$name'")
+        }
+    }
+
+    /**
+     * Lift a brute-force lock.
+     *
+     * The daemon enforces the same policy as the framework's web login (three
+     * seconds before a rejection, five failures inside a day lock the account for
+     * a day), so a locked account has to be unlockable here too — the framework
+     * calls this when an administrator uses `/admin/users/{id}/unlock`. Only an
+     * administrator token may call it.
+     */
+    object Unlock: AbstractPostRoute() {
+        override val path: String = "/instance/unlock"
+
+        data class UnlockData (
+            val username: String,
+        )
+
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val requester = ctx.call.request.header(HttpHeaders.Authorization)
+                ?.let { raw -> runCatching { UUID.fromString(raw) }.getOrNull() }
+                ?.let { tokens[it] }
+                ?: return HttpStatusCode.Unauthorized.description(
+                    "No authorization token provided")
+
+            if (!UserStore.isAdmin(requester))
+                return HttpStatusCode.Unauthorized.description(
+                    "Only an administrator may unlock an account")
+
+            val name = ctx.receive<UnlockData>().username.trim()
+            if (name.isEmpty())
+                return HttpStatusCode.BadRequest.description("Username must not be empty")
+            if (!UserStore.hasUser(name))
+                return HttpStatusCode.NotFound.description("User '$name' not found")
+
+            globalLogger.warn("Administrator '$requester' unlocked the account of '$name'")
+            return mapOf("username" to name, "message" to "Account unlocked")
+                .also { UserStore.unlock(name) }
         }
     }
 
@@ -410,8 +695,16 @@ object PGInstances {
                 ?: return HttpStatusCode.Unauthorized.description("No authorization token provided")
             val user = tokens[token]
                 ?: return HttpStatusCode.BadRequest.description("Token $token not found")
-            instances[instanceName]
+            val metadata = instances[instanceName]
                 ?: return HttpStatusCode.BadRequest.description("Instance $instanceName not found")
+
+            // Instances are namespaced by their owner: a client may only open a
+            // connection to an instance it owns. Without this check the token was
+            // just a liveness token and any user could read (and write) any other
+            // user's analysis data by naming the instance.
+            if (metadata.owner != user)
+                return HttpStatusCode.Forbidden.description(
+                    "Instance $instanceName is owned by another user")
 
             if (!instanceIsOn(instanceName))
                 startInstance(instanceName)

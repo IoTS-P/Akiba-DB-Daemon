@@ -15,6 +15,7 @@ import java.time.Instant
 import java.time.OffsetDateTime
 import java.time.format.DateTimeFormatter
 import java.util.TimeZone
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import kotlin.io.path.absolutePathString
@@ -78,11 +79,23 @@ class BackupManager (
         if (!snapshotPath.toFile().exists())
             snapshotPath.toFile().mkdirs()
 
-        // Because the main instance is set only listening to localhost, we can use a fixed password
+        // The bookkeeping databases (backup repository metadata + backup tree)
+        // live in the *system* PostgreSQL cluster on localhost. They are
+        // provisioned by the deployment (see `backup_db_init.sql`) with a
+        // password that is supplied at deploy time — this code has no
+        // hard-coded fallback, so a misconfigured daemon fails loudly instead
+        // of silently connecting with a well-known credential.
+        val password = config.resolvedBackupDbPassword
+        check(password.isNotBlank()) {
+            "No password for the backup bookkeeping database. Set `backupDbPassword` in the " +
+                "daemon config file, or export AKIBA_DB_PASSWORD before starting the daemon."
+        }
         backupDataSource = PGSimpleDataSource().apply {
-            setUrl("jdbc:postgresql://localhost:5432/akiba_backup")
-            user = "akiba"
-            password = "akiba123"
+            setServerName(config.backupDbHost)
+            setPortNumber(config.backupDbPort)
+            setDatabaseName(config.backupDbName)
+            user = config.backupDbUser
+            setPassword(password)
         }
 
         updateLogicalData()
@@ -175,8 +188,6 @@ class BackupManager (
      */
     @Throws(IllegalStateException::class)
     private fun updateLogicalData() {
-        val url = "jdbc:postgresql://localhost:5432/db_backup_tree"
-
         backupDataSource.connection.use { conn ->
             conn.prepareStatement("""
                 SELECT label, is_expired, parent, backup_alias, description, backup_type, created_at
@@ -219,21 +230,31 @@ class BackupManager (
             ?: logicalBackups.values.maxBy { it.createdAt }
     }
 
+    /**
+     * List the backups that are still **available** for [instanceName] — the
+     * ones a restore can actually target.
+     *
+     * This is what `/backup/peek` returns and what the UI shows when the user
+     * picks a backup to restore. It used to select `is_expired = true`, i.e. the
+     * backups that can no longer be restored (and which the housekeeping pass
+     * deletes outright), so the list came back empty on every deployment.
+     */
     fun getLogicalData(): List<BackupNode> {
-        val url = "jdbc:postgresql://localhost:5432/db_backup_tree"
         val nodes: MutableList<BackupNode> = mutableListOf()
 
         backupDataSource.connection.use { conn ->
             conn.prepareStatement("""
-                SELECT label, parent, backup_alias, description, backup_type, created_at
+                SELECT label, parent, backup_alias, description, backup_type, created_at, is_expired
                 FROM db_backup_tree
-                WHERE instance_name = '$instanceName' AND is_expired = true
+                WHERE instance_name = ? AND is_expired = false
+                ORDER BY created_at
             """.trimIndent()).use { stmt ->
+                stmt.setString(1, instanceName)
                 val rs = stmt.executeQuery()
                 while (rs.next()) {
                     nodes.add(BackupNode(
                         label = rs.getString("label"),
-                        isExpired = true,
+                        isExpired = rs.getBoolean("is_expired"),
                         alias = rs.getString("backup_alias"),
                         description = rs.getString("description"),
                         parent = rs.getString("parent"),
@@ -329,8 +350,17 @@ class BackupManager (
      */
     @Throws(IllegalStateException::class)
     fun backup(alias: String? = null, description: String? = null, isFull: Boolean = false): String {
-        return if (isFull) createFullBackup(alias, description)
-               else createAugmentedBackup(alias, description)
+        // Fail fast rather than queue: a second concurrent run cannot do anything
+        // useful (pgBackRest holds its own repository lock), and the caller needs
+        // to know that a backup is already running.
+        val lock = backupLock
+        if (!lock.tryLock()) throw BackupInProgressException(instanceName)
+        try {
+            return if (isFull) createFullBackup(alias, description)
+                   else createAugmentedBackup(alias, description)
+        } finally {
+            lock.unlock()
+        }
     }
 
     private fun checkPgbackrest(): Boolean {
@@ -352,7 +382,47 @@ class BackupManager (
         return process.exitValue() == 0
     }
 
-    private val backupLock: ReentrantLock = ReentrantLock()
+    /**
+     * Serializes backup/restore work for this instance **across every
+     * BackupManager of that instance**.
+     *
+     * This used to be a plain instance field, and callers construct a *new*
+     * BackupManager per request (`operations/Backups.kt` does `BackupManager(name)`
+     * for every backup, peek and restore) — so two concurrent requests each held
+     * their own lock, both started pgBackRest, and the loser died on pgBackRest's
+     * own repository lock:
+     *
+     *     ERROR: [050]: unable to acquire lock on file '/tmp/pgbackrest/<stanza>-backup-1.lock'
+     *
+     * which reached the UI as a bare HTTP 500. The lock is therefore shared per
+     * instance name. `ReentrantLock` keeps the nested acquisitions
+     * ([backup] → [createFullBackup], [restoreBackup]) working, and
+     * [BackupInProgressException] lets a second caller fail fast with something
+     * actionable instead of hanging for a minute.
+     */
+    private val backupLock: ReentrantLock get() = lockFor(instanceName)
+
+    /**
+     * Translate a failed pgBackRest run into an exception, recognising the
+     * repository-lock error.
+     *
+     * The in-process lock above is the primary guard; this catches a pgBackRest
+     * started outside this daemon (a manual command, a leftover process, or a
+     * second daemon using the same repository), which would otherwise surface as
+     * an opaque internal error.
+     */
+    private fun pgbackrestFailure(operation: String, output: String): IllegalStateException {
+        val lockError = output.contains("unable to acquire lock", ignoreCase = true) ||
+            output.contains("another pgBackRest process", ignoreCase = true)
+        return if (lockError) {
+            globalLogger.warn("pgBackRest is busy with instance $instanceName: ${output.trim()}")
+            BackupInProgressException(instanceName)
+        } else {
+            IllegalStateException(
+                "Error occurred while creating $operation backup for instance $instanceName. " +
+                    "Process output:\n$output")
+        }
+    }
 
     /**
      * Create a full backup in the disk.
@@ -387,10 +457,7 @@ class BackupManager (
 
             // Check process exit code
             if (process.exitValue() != 0)
-                throw IllegalStateException("""
-                Error occurred while creating FULL backup for instance $instanceName. Process output:
-                ${process.inputStream.bufferedReader().readText()}
-            """.trimIndent())
+                throw pgbackrestFailure("FULL", process.inputStream.bufferedReader().readText())
 
             // Update database
 
@@ -488,10 +555,8 @@ class BackupManager (
 
             // Check process exit code
             if (process.exitValue() != 0)
-                throw IllegalStateException("""
-                Error occurred while creating ${backupType.name} backup for instance $instanceName. Process output:
-                ${process.inputStream.bufferedReader().readText()}
-            """.trimIndent())
+                throw pgbackrestFailure(
+                    backupType.name, process.inputStream.bufferedReader().readText())
 
             val thisBackup = obtainPhysicalBackup().maxBy { it.startTimestamp }
             globalLogger.info(
@@ -534,7 +599,12 @@ class BackupManager (
 
     @Throws(IllegalArgumentException::class)
     fun restoreBackup(labelOrAlias: String) {
-        backupLock.withLock {
+        // Same fast-fail as [backup]: a restore must not overlap a backup of the
+        // same instance, and the caller should hear about it immediately.
+        val lock = backupLock
+        if (!lock.tryLock()) throw BackupInProgressException(instanceName)
+        try {
+        lock.withLock {
             val target = findBackup(labelOrAlias)
                 ?: throw IllegalArgumentException("Backup $labelOrAlias not found in the database")
             if (target.isExpired) throw IllegalArgumentException("Backup $labelOrAlias is already expired")
@@ -630,6 +700,9 @@ class BackupManager (
             // 4. Update the logical prior backup
             PGInstances.instances[instanceName]!!.logicalPrior = target.label
         }
+        } finally {
+            lock.unlock()
+        }
     }
 
     private fun findBackup(labelOrAlias: String): BackupNode? {
@@ -671,6 +744,31 @@ class BackupManager (
     }
 
     companion object {
+        /**
+         * Process-wide backup/restore locks, keyed by instance name.
+         *
+         * Shared on purpose: callers create a new BackupManager per request, so a
+         * per-object lock would not exclude anything — see [backupLock].
+         */
+        private val backupLocks = ConcurrentHashMap<String, ReentrantLock>()
+
+        private fun lockFor(instanceName: String): ReentrantLock =
+            backupLocks.computeIfAbsent(instanceName) { ReentrantLock() }
+
+        /**
+         * Whether a backup or restore of [instanceName] is running right now.
+         *
+         * Queried by the framework so the UI can disable "Back up" while a run is
+         * in progress — including runs started from another tab, the CLI, or the
+         * automatic snapshot after a write, not just the caller's own request.
+         */
+        fun isBackupRunning(instanceName: String): Boolean =
+            backupLocks[instanceName]?.isLocked == true
+
+        /** Instance names with a backup/restore in flight, for the UI to grey out. */
+        fun busyInstances(): Set<String> =
+            backupLocks.filterValues { it.isLocked }.keys.toSet()
+
         @Throws(IllegalArgumentException::class)
         private fun parseBackupNode(node: JsonNode): PhysicalBackupData {
             val label = node.at("/label").let {
@@ -710,3 +808,20 @@ class BackupManager (
         }
     }
 }
+
+/**
+ * Another backup or restore of the same instance is already running.
+ *
+ * An expected, user-triggerable condition — double-clicking "Back up", or a
+ * snapshot racing a manual backup — not an internal failure: callers translate it
+ * into a "busy, try again" answer (HTTP 409 / websocket close code 4409) rather
+ * than a 500.
+ *
+ * Top-level on purpose: nested classes declared inside a companion object are not
+ * reachable as `BackupManager.BackupInProgressException` from other files.
+ */
+class BackupInProgressException(instanceName: String) : IllegalStateException(
+    // Kept short: this text also travels as a websocket close reason, which
+    // RFC 6455 caps at 123 bytes (see AbstractWebsocketRoute).
+    "Another backup or restore of instance '$instanceName' is running; retry when it finishes."
+)

@@ -42,13 +42,19 @@ object RouteRegistry {
         Controls.Heartbeat,
 
         PGInstances.ClientLogin,
+        PGInstances.ClientRegister,
         PGInstances.ClientLogout,
         PGInstances.ConnectToInstance,
         PGInstances.DisconnectFromInstance,
+        PGInstances.ListInstances,
+        PGInstances.WorkerGrant,
+        PGInstances.SetPassword,
+        PGInstances.Unlock,
         PGInstances.ShutdownInstance,
         PGInstances.DeleteInstance,
 
         Backups.PeekBackup,
+        Backups.BackupStatus,
 
         // Agent Framework routes
         AgentOps.CreateSession,

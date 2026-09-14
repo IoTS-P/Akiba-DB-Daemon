@@ -11,25 +11,52 @@
   // Console and file log levels
   "consoleLogLevel": "INFO",
   "fileLogLevel": "DEBUG",
-  // Database username
-  "dbUserName": "test",
-  // Database password
-  "dbPassword": "test123",
-  // Database name
-  "dbName": "akiba"
+  // HTTP service port
+  "serverPort": 31777,
+  // PostgreSQL instance directory (one sub-directory per instance; ports are
+  // allocated automatically starting at 31800)
+  "instanceRoot": "/akiba/instances",
+  // pgbackrest repository root
+  "backupRoot": "/akiba/backups",
+  // Instance map file (name -> port / owner / last restored backup)
+  "instanceMapFile": "/home/akiba/.akiba/instances.json",
+  // Credential store. When the file is missing or empty, the first successful
+  // login registers itself as this daemon's first administrator (this keeps
+  // deployments that predate authentication usable); afterwards every login
+  // must match a stored bcrypt hash.
+  "usersFile": "/home/akiba/.akiba/users.json",
+  // Connection info of the backup bookkeeping database (it lives in the system
+  // PostgreSQL cluster, not in a user instance). When `backupDbPassword` is
+  // empty the daemon reads AKIBA_DB_PASSWORD; if both are empty it refuses to
+  // run any backup/restore (there is no hard-coded fallback password).
+  "backupDbHost": "localhost",
+  "backupDbPort": 5432,
+  "backupDbUser": "akiba",
+  "backupDbPassword": "",
+  "backupDbName": "akiba_backup",
+  "backupTreeDbName": "db_backup_tree",
+  // Lock / token timeouts (seconds)
+  "maxLockWaitingTime": 3600,
+  "maxTokenWaitingTime": 7200,
+  // Maximum time a single database operation may block its caller (seconds)
+  "dbOperationTimeoutSeconds": 120
 }
 ```
 
+**The daemon ships no account at all**: no default username and no default
+password. Credentials are created through `/instance/register` (or by the very
+first login when the store is empty) and stored as bcrypt hashes in `usersFile`.
+
 ### Database Files
 
-You can use `subprojects/akiba_db_daemon/src/main/resources/database_init.sql` to create a database template that can be used directly. The meaning and function of all fields are defined in the comments in the database script file. In the default compiled database daemon compressed package, the `subprojects/akiba_db_daemon/src/main/resources/initialize_pg_local.sh` script will initialize the specified database. When starting the database daemon, it will attempt to connect and initialize the database using`dbUserName` as the database username, `dbName` as the database name, and `dbPassword` as the database password from the configuration.
+You can use `subprojects/akiba_db_daemon/src/main/resources/database_init.sql` to create a database template that can be used directly. The meaning and function of all fields are defined in the comments in the database script file. In the default compiled database daemon compressed package, the `subprojects/akiba_db_daemon/src/main/resources/initialize_pg_instance.sh` script creates a single instance (initdb, write the pgbackrest configuration, create the database and run `database_init.sql`); the daemon invokes it from `/ws/instance/create`, and the instance's owner is the user who requested it.
 
 Database initialization will create 4 data tables, 1 view, and 1 index:
 
 - `binaries`: Original binary file information
 - `processed_binaries`: Processed binary file information
 - `results`: Global task data
-- `db_backup_tree`: Database backup tree (not yet implemented)
+- `db_backup_tree`: Backup tree (**implemented**; the table lives in the daemon's own bookkeeping database, created by `resources/backup_db_init.sql`, and records each backup's parent/child relation, alias and expiry state)
 - `using_binaries`: View of actual used binary file information (i.e., if a file exists in `processed_binaries`, the processed file is used; otherwise, the original file is used)
 
 In `subprojects/akiba_db_daemon/src/main/resources/database_init.sql`, there are definitions for the structure of the above 5 tables. After removing format checks, the corresponding Chinese comments are as follows:
@@ -109,12 +136,51 @@ The Akiba Database Daemon enables the HTTP service at 0.0.0.0:31777 by default. 
 
 ### 2.1 Authentication and Authorization
 
-Most interfaces require adding the `Authorization` field in the HTTP Header, whose value is the UUID Token obtained during login.
+Except for `/test`, `/instance/login` and `/instance/register`, every interface requires the
+`Authorization` field in the HTTP Header, whose value is the UUID Token obtained during login.
 
 **Login Process:**
-1. Call `/instance/login` interface to get Token
-2. Add `Authorization: <token>` in the Header of subsequent requests
+1. Call `/instance/login` with a username and password to get a Token. The daemon verifies the
+   password against the bcrypt hash in `usersFile`; an unknown username and a wrong password both
+   return `401` and are deliberately indistinguishable.
+   - If the credential store is empty (a fresh deployment, or one that upgraded from a version
+     without authentication), this login registers the username as the daemon's first administrator.
+2. Add `Authorization: <Token>` to the Header of subsequent requests
 3. Call `/instance/logout` to log out
+
+**Brute-force protection (the same policy the web login applies):**
+- every rejected login — wrong password *or* unknown username — waits **3 seconds** before the
+  `401` is sent, so the endpoint cannot serve as a fast password oracle;
+- **5 consecutive failures within 24 hours** lock the account for **24 hours**; while locked, even
+  the correct password gets `423 Locked` and the message states when it unlocks;
+- `POST /instance/unlock` (administrator token required, body `{"username": "..."}`) lifts the lock
+  early;
+- **Exception: callers on the loopback interface (`127.0.0.1`) are neither delayed nor counted.**
+  In a single-host deployment the only loopback client is the Akiba framework server, which relays
+  credentials a human already entered at the web login — not an attacker. Without this exemption,
+  anyone able to reach port 31777 could lock an account with five wrong guesses and thereby cut the
+  deployment off from its own daemon. Remote (non-loopback) callers get the full policy.
+- The failure count and the lock live in `usersFile` (`failedAttempts` / `lockedUntil`), so a restart
+  does not clear a lock.
+
+**Account management:**
+- `POST /instance/register`: create a credential (username, password, admin flag). Creating a
+  **plain** user needs no authorization — a new username owns no instance and `/instance/connect`
+  enforces ownership, so it can reach no data. Marking a user as administrator requires an
+  administrator token.
+- `POST /instance/set-password`: change an existing credential's password (administrator token
+  required). The framework calls it on an administrator password reset; without it the account could
+  sign in but every instance operation would be rejected.
+- `POST /instance/unlock`: lift an account's brute-force lock (administrator token required).
+- `POST /instance/list`: returns the instances **owned by the caller** (name, port, whether it is
+  running, last restored backup). The web UI uses it to answer "does this user have an instance yet?".
+- `POST /instance/worker-grant`: mints a derived credential for the caller (plaintext returned once,
+  12 hours by default). The framework uses it when spawning child processes (workflow runs, manual
+  agents) so that the account password never has to be written into a generated config file.
+
+**Owner isolation:** an instance belongs to the username that created it, and `/instance/connect`
+only lets the owner connect to their own instances — everyone else gets `403`. This is what makes
+"each user only sees their own instances" true.
 
 ---
 
@@ -516,6 +582,15 @@ Create a database backup (WebSocket interface).
 }
 ```
 
+**Concurrency (important):** backups and restores of one instance are
+**serialized**. If a backup or restore of that instance is already running, the
+second request is refused immediately (websocket close code `4409`, which the
+framework maps to HTTP `409`) instead of starting a second pgBackRest — which
+would die on pgBackRest's repository lock with
+`ERROR: [050]: unable to acquire lock on file '/tmp/pgbackrest/<stanza>-backup-1.lock'`
+and reach the caller as a meaningless 500. A first full backup can take a minute,
+so retry once it reports completion.
+
 #### POST /backup/peek
 View backup tree information of an instance.
 
@@ -525,6 +600,22 @@ View backup tree information of an instance.
 ```
 
 **Response:** JSON representation of backup tree
+
+#### POST /backup/status
+Report whether a backup or restore of an instance (or of every instance the caller
+owns) is running right now.
+
+**Request:** `{"instance": "my_instance"}`, or `{}` for every instance of the caller.
+
+**Response:**
+```json
+{ "busyInstances": ["my_instance"], "busy": true }
+```
+
+`busyInstances` lists the caller's instances with a run in flight; asking about one
+instance also returns `busy`. The framework derives `backupInProgress` on
+`GET /api/instances` and `busy` on `GET /api/instances/backups` from it, and the UI
+**disables** the backup button accordingly instead of letting the click be refused.
 
 #### WebSocket /ws/backup/restore
 Restore database from backup (WebSocket interface).

@@ -28,5 +28,32 @@ data class Configs (
     val instanceRoot: String = "psql_instances",
     // The JSON file containing local instance information
     // NOTE: You CANNOT specify '~/.akiba/instances.json' which will be regarded as a relative path!
-    val instanceMapFile: String = System.getProperty("user.home") + "/.akiba/instances.json"
-)
+    val instanceMapFile: String = System.getProperty("user.home") + "/.akiba/instances.json",
+
+    // Credential store for /instance/login, /instance/register and /instance/list.
+    // There is deliberately NO default account: the first login against an empty
+    // store registers itself as the administrator (see `UserStore`).
+    val usersFile: String = System.getProperty("user.home") + "/.akiba/users.json",
+
+    // ---------------------------------------------------------------------
+    //  Bookkeeping database used for the backup tree (`db_backup_tree`) and
+    //  the backup repository metadata (`akiba_backup`).  Both live in the
+    //  *system* PostgreSQL cluster (the one installed by the OS/Docker
+    //  image), NOT in the per-user instances.
+    //
+    //  `backupDbPassword` intentionally defaults to the empty string: it is
+    //  read from the `AKIBA_DB_PASSWORD` environment variable when unset, and
+    //  the daemon refuses backup operations when neither is provided.  There
+    //  is no hard-coded fallback password.
+    // ---------------------------------------------------------------------
+    val backupDbHost: String = "localhost",
+    val backupDbPort: Int = 5432,
+    val backupDbUser: String = "akiba",
+    val backupDbPassword: String = "",
+    val backupDbName: String = "akiba_backup",
+    val backupTreeDbName: String = "db_backup_tree",
+) {
+    /** Resolved password for the bookkeeping databases. Never a built-in default. */
+    val resolvedBackupDbPassword: String
+        get() = backupDbPassword.ifBlank { System.getenv("AKIBA_DB_PASSWORD") ?: "" }
+}

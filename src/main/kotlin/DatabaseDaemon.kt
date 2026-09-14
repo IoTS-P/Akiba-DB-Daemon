@@ -38,7 +38,7 @@ class DatabaseDaemon : Runnable {
 
     @CommandLine.Option(
         names = ["--skip-init", "--no-skip-init"],
-        description = ["Skip initialization of local database (initialize_pg_local.sh)"]
+        description = ["Skip initialization of the local PostgreSQL cluster"]
     )
     var skipInit: Boolean = false
 
