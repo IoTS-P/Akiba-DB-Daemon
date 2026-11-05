@@ -50,9 +50,11 @@ object Insertions {
             val size: Long,
             val processedSize: Long = -1,
             val loadProperties: String? = null,
-            val arch: String,
-            val format: String,
-            val compilerSpec: String,
+            // Null until the architecture-identification module settles them;
+            // setString(pos, null) writes SQL NULL, which the column allows.
+            val arch: String? = null,
+            val format: String? = null,
+            val compilerSpec: String? = null,
             // Provenance for files imported at runtime by a module:
             //   sourceId     = id of the binary being analyzed when this file was imported
             //                  (null for top-level imports done by ImportManager)

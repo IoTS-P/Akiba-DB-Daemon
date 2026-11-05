@@ -13,14 +13,14 @@ import java.util.UUID
  * referenced by id.
  *
  * Lifecycle access control is enforced in
- * [org.iotsplab.akiba.llm.agent.AgentMailboxService.send] and re-checked
+ * [org.iotsplab.akiba.llm.agent.mailbox.AgentMailboxService.send] and re-checked
  * here as defense-in-depth.
  */
 object MailboxOps {
 
     /**
      * Well-known UUID for the reserved "system" sender used by
-     * [org.iotsplab.akiba.llm.agent.AgentMailboxDispatcher] when
+     * [org.iotsplab.akiba.llm.agent.mailbox.AgentMailboxDispatcher] when
      * delivering synthetic wake-condition messages.  The row is
      * created lazily by [SendMessage] on first use so the
      * `sender_session_id` FK on `agent_mailbox_messages` is

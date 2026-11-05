@@ -670,7 +670,7 @@ object AgentOps {
     /**
      * Update the session's `runtime_state` and optional
      * `closing_reason`. The route performs no transition validation —
-     * the framework's [org.iotsplab.akiba.llm.agent.RuntimeState] is
+     * the framework's [org.iotsplab.akiba.llm.agent.runtime.RuntimeState] is
      * the source of truth for legal transitions; this route just
      * mirrors them. The schema CHECK constraint rejects unknown
      * values, so a typo at the call site fails loud.
@@ -734,7 +734,7 @@ object AgentOps {
     /**
      * Fetch the session's current `runtime_state` and
      * `closing_reason`. Cheap query used by the dispatcher
-     * pre-flight and by [org.iotsplab.akiba.llm.agent.JobHandle.await]
+     * pre-flight and by [org.iotsplab.akiba.llm.agent.runtime.JobHandle.await]
      * to resolve the initial state without joining the framework's
      * in-process cache.
      */
