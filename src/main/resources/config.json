@@ -2,5 +2,9 @@
   "consoleLogLevel": "TRACE",
   "fileLogLevel": "DEBUG",
   "backupRoot": "/akiba/backups",
-  "instanceRoot": "/akiba/instances"
+  "dbHost": "localhost",
+  "dbPort": 5432,
+  "dbUser": "akiba",
+  "instanceDatabasePrefix": "inst_",
+  "instanceSchemaFile": "resources/database_init.sql"
 }

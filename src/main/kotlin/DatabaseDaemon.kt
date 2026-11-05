@@ -106,8 +106,8 @@ class DatabaseDaemon : Runnable {
 
             globalLogger.info("Server stopped")
 
-            // Shut down all instances and write instance data into file
-            PGInstances.shutdownAllInstances()
+            // Instances are databases in the deployment's cluster, so there is
+            // nothing to shut down — only the instance map has to be persisted.
 
             val instanceFile = Path.of("${System.getProperty("user.home")}/.akiba/instances.json")
             if (!instanceFile.exists()) {

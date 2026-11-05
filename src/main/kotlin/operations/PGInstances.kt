@@ -1,5 +1,6 @@
 package org.iotsplab.akiba.dbDaemon.operations
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import io.ktor.http.HttpHeaders
@@ -35,6 +36,7 @@ import org.iotsplab.akiba.dbDaemon.token.TimedResourceMap.NotOwnedException
 import java.io.File
 import java.nio.file.Path
 import java.sql.Connection
+import java.sql.DriverManager
 import java.time.Duration
 import java.time.Instant
 import java.util.UUID
@@ -49,18 +51,22 @@ import kotlin.jvm.Throws
 
 object PGInstances {
 
+    /**
+     * One instance — a single database inside the shared cluster.
+     *
+     * [owner] is the account that created it and is what the connect/delete
+     * ownership checks compare against; [logicalPrior] records the last backup
+     * restored into it so backup trees stay coherent. Neither decides where the
+     * data lives: there is one cluster, addressed by [Configs.dbPort].
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
     data class InstanceMetadata (
-        val port: Int,
-        val owner: String,   // Also the name of the only database contained in this instance
-        var logicalPrior: String?    // Last backup restored, used to build backup trees
+        val owner: String,
+        var logicalPrior: String?
     )
 
-    const val MIN_PORT = 31800
-    const val MAX_PORT = 31999
-
-    // Major version of postgresql
+    // Major version of postgresql, used by the backup tooling
     var pgVer: Int = -1
-    val instanceRoot: Path = Path.of(config.instanceRoot).absolute()
 
     // instances created
     // key: instance name
@@ -74,14 +80,33 @@ object PGInstances {
         } else
             mutableMapOf()
 
-        val getVer = ProcessBuilder("pg_config", "--version").start()
-        getVer.waitFor()
-        pgVer = getVer.inputStream.bufferedReader().readText()
-            .substringAfter("PostgreSQL")
-            .substringBefore(".")
-            .trim()
-            .toInt()
+        pgVer = runCatching {
+            val getVer = ProcessBuilder("pg_config", "--version").start()
+            getVer.waitFor()
+            getVer.inputStream.bufferedReader().readText()
+                .substringAfter("PostgreSQL")
+                .substringBefore(".")
+                .trim()
+                .toInt()
+        }.getOrDefault(-1)
     }
+
+    /** Name of the database that holds [instanceName]. */
+    fun databaseName(instanceName: String): String =
+        config.instanceDatabasePrefix + instanceName
+
+    /**
+     * Connection to the shared cluster.
+     *
+     * Sessions authenticate as [Configs.dbUser]; the password comes from
+     * `AKIBA_DB_PASSWORD` so no credential is baked into the distribution.
+     */
+    fun clusterConnection(database: String = "postgres"): Connection =
+        DriverManager.getConnection(
+            "jdbc:postgresql://${config.dbHost}:${config.dbPort}/$database",
+            config.dbUser,
+            config.resolvedDbPassword.ifBlank { null },
+        )
 
     /**
      * User session map: Map storing tokens and relative resources.
@@ -175,150 +200,106 @@ object PGInstances {
         }
     }
 
-    @Throws(PGPortFullException::class, IllegalStateException::class)
+    /**
+     * Create the instance database and apply the schema.
+     *
+     * Replaces the old per-instance `initdb` + `pg_ctl start` script: creating a
+     * database is a catalogue operation now, and the cluster itself is started
+     * by the deployment, not by the daemon.
+     */
+    @Throws(IllegalStateException::class, IllegalArgumentException::class)
     private fun createPsqlInstance(userName: String, instanceName: String): InstanceMetadata {
-        val port = selectInstancePort()
-        val scriptPath = File("resources/initialize_pg_instance.sh")
-        if (!scriptPath.exists()) {
+        validateInstanceName(instanceName)
+        val database = databaseName(instanceName)
+
+        val schemaFile = File(config.instanceSchemaFile)
+        if (!schemaFile.exists()) {
             throw IllegalStateException(
-                "Initialization script not found at ${scriptPath.absolutePath} " +
-                "(working dir = ${File(".").absolutePath}). The akiba_db_daemon distribution " +
-                "must be unpacked with its resources/ directory intact."
+                "Schema file not found at ${schemaFile.absolutePath} (working dir = " +
+                    "${File(".").absolutePath}). The akiba_db_daemon distribution must be " +
+                    "unpacked with its resources/ directory intact."
             )
         }
-        val process = ProcessBuilder("bash", scriptPath.path)
-        val env = process.environment()
-        env["INSTANCE_NAME"] = instanceName
-        env["INSTANCE_ROOT"] = instanceRoot.toString()
-        env["BACKUP_ROOT"] = config.backupRoot
-        env["USER_NAME"] = userName
-        env["PORT"] = port.toString()
-        val p = process.redirectErrorStream(true).start()
-        // Capture once — we want to log the full output AND embed (a truncated form of) it
-        // in the IllegalStateException. Reading the stream twice would block.
-        val output = p.inputStream.bufferedReader().readText()
-        p.waitFor()
-        if (p.exitValue() != 0) {
-            globalLogger.error(
-                "Instance $instanceName initialization script (exit=${p.exitValue()}) full output:\n$output")
-            throw IllegalStateException(
-                "Instance $instanceName initialization failed (exit=${p.exitValue()}); " +
-                "see daemon log for full output. Tail: " +
-                output.lines().filter { it.isNotBlank() }.takeLast(3).joinToString(" | ")
-            )
+        val schema = schemaFile.readText()
+
+        clusterConnection().use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.executeUpdate("CREATE DATABASE \"$database\"")
+            }
         }
-        return InstanceMetadata(port, userName, null)
+        clusterConnection(database).use { conn ->
+            conn.createStatement().use { stmt -> stmt.execute(schema) }
+        }
+        return InstanceMetadata(userName, null)
     }
 
     @Throws(IllegalStateException::class, IllegalArgumentException::class)
     private fun deletePsqlInstanceUnchecked(instanceName: String) {
-        // We must check the instance name to avoid directory traversal
-        // After all running "rm -rf /" is not a good idea :(
-        if (instanceName.contains("/"))
-            throw IllegalArgumentException("Instance name cannot contain /")
-        val instancePath = instanceRoot.resolve(instanceName)
-        if (instancePath.notExists())
-            return
-        val process = ProcessBuilder("sudo", "rm", "-rf", "$instanceRoot/$instanceName")
-        val p = process.redirectErrorStream(true).start()
-        p.waitFor()
-        if (instancePath.exists())
-            throw IllegalStateException(
-                "Instance $instanceName deletion failed, output:\n" + p.inputStream.bufferedReader().readText())
+        validateInstanceName(instanceName)
+        clusterConnection().use { conn ->
+            conn.createStatement().use { stmt ->
+                // FORCE disconnects leftover clients; without it a stale session
+                // would make deletion fail after the UI already said it worked.
+                stmt.executeUpdate("DROP DATABASE IF EXISTS \"${databaseName(instanceName)}\" WITH (FORCE)")
+            }
+        }
     }
 
+    /** Instance names become part of a database name, so keep them plain. */
+    private fun validateInstanceName(instanceName: String) {
+        if (!instanceName.matches(Regex("[A-Za-z0-9_]{1,48}"))) {
+            throw IllegalArgumentException(
+                "Instance name must be 1-48 characters of letters, digits or underscore")
+        }
+    }
+
+    /** Whether the shared cluster answers; an instance is "on" iff the cluster is. */
     @Throws(IllegalArgumentException::class)
     fun instanceIsOn(instanceName: String): Boolean {
-        val instanceInfo = instances[instanceName]
+        instances[instanceName]
             ?: throw IllegalArgumentException("Instance $instanceName not found")
-        val process = ProcessBuilder(
-            "pg_isready", "-h", "127.0.0.1", "-p", instanceInfo.port.toString(),
-            "-U", instanceInfo.owner, "-d", instanceInfo.owner).start()
-        process.waitFor()
-        return process.exitValue() == 0
+        return runCatching { clusterConnection().use { true } }.getOrDefault(false)
     }
 
     /**
-     * Returns true iff the cluster is currently in PostgreSQL recovery / hot-standby mode
-     * (i.e. `pg_is_in_recovery()` returns `t`). In that state every write transaction is
-     * rejected with `cannot execute ... in a read-only transaction`. Used by
-     * `BackupManager.restoreBackup` as a defence-in-depth check after a pgbackrest restore
-     * — if the cluster did not auto-promote despite `--target-action=promote`, we fall
-     * back to `pg_ctl promote`.
+     * Whether the cluster is in recovery / hot-standby mode.
      *
-     * Returns false (best-effort) if the instance is not yet accepting connections at all,
-     * or if the helper psql call itself errors out for any unrelated reason.
+     * Kept for the restore path: a restore that did not promote would otherwise
+     * surface as a read-only error on the first write.
      */
     @Throws(IllegalArgumentException::class)
     fun instanceIsInRecovery(instanceName: String): Boolean {
-        val instanceInfo = instances[instanceName]
+        instances[instanceName]
             ?: throw IllegalArgumentException("Instance $instanceName not found")
-        if (!instanceIsOn(instanceName)) return false
-        val process = ProcessBuilder(
-            "sudo", "-u", "postgres",
-            "psql", "-h", "127.0.0.1", "-p", instanceInfo.port.toString(),
-            "-U", instanceInfo.owner, "-d", instanceInfo.owner,
-            "-tAqc", "SELECT pg_is_in_recovery();"
-        ).redirectErrorStream(true).start()
-        process.waitFor()
-        if (process.exitValue() != 0) return false
-        val output = process.inputStream.bufferedReader().readText().trim()
-        return output.equals("t", ignoreCase = true) || output.equals("true", ignoreCase = true)
+        return runCatching {
+            clusterConnection().use { conn ->
+                conn.createStatement().use { stmt ->
+                    stmt.executeQuery("SELECT pg_is_in_recovery()").use { rs ->
+                        rs.next() && rs.getBoolean(1)
+                    }
+                }
+            }
+        }.getOrDefault(false)
     }
 
-    @Throws(IllegalArgumentException::class, IllegalStateException::class)
+    /**
+     * Instances have no lifecycle of their own any more.
+     *
+     * They used to be clusters that could be stopped to reclaim memory; now they
+     * are databases in a cluster owned by the deployment, so start/shutdown are
+     * no-ops kept for the route surface (Disconnect and Delete still call them).
+     */
+    @Throws(IllegalArgumentException::class)
     fun startInstance(instanceName: String) {
-        val instanceInfo = instances[instanceName]
+        instances[instanceName]
             ?: throw IllegalArgumentException("Instance $instanceName not found")
-        if (instanceIsOn(instanceName))
-            return
-
-        val startProcess = ProcessBuilder("sudo", "-i", "-u", "postgres",
-            "/usr/lib/postgresql/$pgVer/bin/pg_ctl", "-D", "$instanceRoot/$instanceName", "-w", "start").start()
-        startProcess.waitFor()
-
-        if (!instanceIsOn(instanceName))
-            throw IllegalStateException("Instance $instanceName failed to start, process output: " +
-                startProcess.inputStream.bufferedReader().readText()
-            )
     }
 
-    @Throws(IllegalArgumentException::class, IllegalStateException::class)
+    @Throws(IllegalArgumentException::class)
     fun shutdownInstance(instanceName: String) {
-        val instanceInfo = instances[instanceName]
+        instances[instanceName]
             ?: throw IllegalArgumentException("Instance $instanceName not found")
-        if (!instanceIsOn(instanceName))
-            return
-
-        val shutdownProcess = ProcessBuilder("sudo", "-i", "-u", "postgres",
-            "/usr/lib/postgresql/$pgVer/bin/pg_ctl", "-D", "$instanceRoot/$instanceName", "-w", "stop").start()
-        shutdownProcess.waitFor()
-
-        if (instanceIsOn(instanceName))
-            throw IllegalStateException("Instance $instanceName failed to stop, process output: " +
-                shutdownProcess.inputStream.bufferedReader().readText()
-            )
     }
-
-    @Throws(PGPortFullException::class)
-    private fun selectInstancePort(): Int {
-        for (port in MIN_PORT..MAX_PORT) {
-            if (instances.values.any { it.port == port })
-                continue
-            return port
-        }
-        throw PGPortFullException()
-    }
-
-    @Throws(IllegalArgumentException::class, IllegalStateException::class)
-    fun shutdownAllInstances() {
-        instances.forEach { (name, metadata) ->
-            if (instanceIsOn(name))
-                shutdownInstance(name)
-        }
-    }
-
-    class PGPortFullException: Exception("PostgreSQL instance full, no local port available")
 
     // ============================================================
     // -------------------------- ROUTES --------------------------
@@ -483,7 +464,10 @@ object PGInstances {
                 .map { (name, meta) ->
                     mapOf(
                         "name" to name,
-                        "port" to meta.port,
+                        // The instance is a database in the shared cluster, so
+                        // the only port it can report is the cluster's.
+                        "port" to config.dbPort,
+                        "database" to databaseName(name),
                         "logicalPrior" to meta.logicalPrior,
                         "running" to instanceIsOn(name),
                     )
@@ -668,8 +652,6 @@ object PGInstances {
                     creatingInstances = null
                     globalLogger.info("PostgreSQL instance ${data.instanceName} created for user $user")
                 }
-            } catch (_: PGPortFullException) {
-                throw AkibaWebsocketException("No more ports available")
             } catch (e: IllegalStateException) {
                 throw AkibaWebsocketException("Instance ${data.instanceName} initialization failed:\n" +
                         "${e.message}")

@@ -31,11 +31,15 @@ class UserDatabaseSession (val instanceName: String) {
         val instanceMetadata: PGInstances.InstanceMetadata = PGInstances.instances[instanceName]
             ?: throw IllegalArgumentException("Instance $instanceName not found")
 
-        val url = "jdbc:postgresql://127.0.0.1:${instanceMetadata.port}/$instanceName"
+        // One cluster, one role: the instance is the database inside it.
+        val cfg = DatabaseDaemon.Companion.config
+        val url = "jdbc:postgresql://${cfg.dbHost}:${cfg.dbPort}/" +
+            PGInstances.databaseName(instanceName)
+        val password = cfg.resolvedDbPassword
         this@UserDatabaseSession.dataSource = PGSimpleDataSource().apply {
             setURL(url)
-            user = instanceMetadata.owner
-            password = null
+            user = cfg.dbUser
+            if (password.isNotBlank()) setPassword(password)
         }
         dataSource.connection.use { conn ->
             DatabaseDaemon.Companion.globalLogger.info("Local database connected")

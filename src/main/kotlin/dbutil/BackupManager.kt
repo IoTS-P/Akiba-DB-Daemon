@@ -85,16 +85,16 @@ class BackupManager (
         // password that is supplied at deploy time — this code has no
         // hard-coded fallback, so a misconfigured daemon fails loudly instead
         // of silently connecting with a well-known credential.
-        val password = config.resolvedBackupDbPassword
+        val password = config.resolvedDbPassword
         check(password.isNotBlank()) {
-            "No password for the backup bookkeeping database. Set `backupDbPassword` in the " +
+            "No password for the database cluster. Set `dbPassword` in the " +
                 "daemon config file, or export AKIBA_DB_PASSWORD before starting the daemon."
         }
         backupDataSource = PGSimpleDataSource().apply {
-            setServerName(config.backupDbHost)
-            setPortNumber(config.backupDbPort)
+            setServerName(config.dbHost)
+            setPortNumber(config.dbPort)
             setDatabaseName(config.backupDbName)
-            user = config.backupDbUser
+            user = config.dbUser
             setPassword(password)
         }
 
@@ -349,7 +349,26 @@ class BackupManager (
      * @param isFull Whether to create a full backup
      */
     @Throws(IllegalStateException::class)
+    /**
+     * Physical backups were tied to a per-instance PostgreSQL cluster.
+     *
+     * Instances are databases in the deployment's shared cluster now, so a
+     * pgbackrest stanza per instance no longer describes anything: the data
+     * directory it would copy belongs to every instance at once. Backup and
+     * restore stay disabled until they are reimplemented as logical dumps
+     * (`pg_dump` / `pg_restore` per instance database) — failing here is better
+     * than writing a stanza that silently covers the wrong scope.
+     */
+    private fun requireBackupMode() {
+        throw IllegalStateException(
+            "Physical backups are unavailable in single-cluster mode: instance " +
+                "'$instanceName' is a database, not a cluster. Backup needs the " +
+                "pg_dump-based rewrite before it can be enabled again."
+        )
+    }
+
     fun backup(alias: String? = null, description: String? = null, isFull: Boolean = false): String {
+        requireBackupMode()
         // Fail fast rather than queue: a second concurrent run cannot do anything
         // useful (pgBackRest holds its own repository lock), and the caller needs
         // to know that a backup is already running.
@@ -599,6 +618,7 @@ class BackupManager (
 
     @Throws(IllegalArgumentException::class)
     fun restoreBackup(labelOrAlias: String) {
+        requireBackupMode()
         // Same fast-fail as [backup]: a restore must not overlap a backup of the
         // same instance, and the caller should hear about it immediately.
         val lock = backupLock
@@ -658,29 +678,14 @@ class BackupManager (
             // refuse to start
             PGInstances.startInstance(instanceName)
 
-            // 3b. Defence-in-depth: even though the restore was launched with
-            //     `--target-action=promote`, some pgbackrest builds or configs may still
-            //     leave the cluster in recovery (e.g. when target-action is silently
-            //     overridden by a pg_hba/postgresql.auto.conf interaction). If the
-            //     cluster is still read-only after start, kick `pg_ctl promote` directly.
-            //     The blocking wait is short and bounded — we only do this in the rare
-            //     fallthrough case.
+            // 3b. Defence-in-depth: a restore that did not promote leaves the
+            //     cluster read-only. The daemon no longer owns the cluster — the
+            //     deployment starts it — so it can only wait and report instead of
+            //     calling `pg_ctl promote` on a data directory it does not have.
             try {
                 val maxAttempts = 10
                 var attempt = 0
                 while (attempt < maxAttempts && PGInstances.instanceIsInRecovery(instanceName)) {
-                    val promoteProcess = ProcessBuilder(
-                        "sudo", "-i", "-u", "postgres",
-                        "/usr/lib/postgresql/${PGInstances.pgVer}/bin/pg_ctl",
-                        "-D", "${PGInstances.instanceRoot}/$instanceName", "-w", "promote"
-                    ).redirectErrorStream(true).start()
-                    promoteProcess.waitFor()
-                    if (promoteProcess.exitValue() != 0) {
-                        globalLogger.warn(
-                            "pg_ctl promote attempt ${attempt + 1} returned ${promoteProcess.exitValue()}, " +
-                            "output: ${promoteProcess.inputStream.bufferedReader().readText()}"
-                        )
-                    }
                     Thread.sleep(200)
                     attempt++
                 }
