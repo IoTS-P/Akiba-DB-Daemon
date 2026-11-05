@@ -1,37 +1,49 @@
 package org.iotsplab.akiba.dbDaemon.dbutil
 
 import com.fasterxml.jackson.core.JsonGenerator
-import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.JsonSerializer
 import com.fasterxml.jackson.databind.SerializerProvider
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
-import org.iotsplab.akiba.dbDaemon.DatabaseDaemon
+import com.fasterxml.jackson.module.kotlin.readValue
 import org.iotsplab.akiba.dbDaemon.DatabaseDaemon.Companion.config
 import org.iotsplab.akiba.dbDaemon.DatabaseDaemon.Companion.globalLogger
 import org.iotsplab.akiba.dbDaemon.operations.PGInstances
-import org.postgresql.ds.PGSimpleDataSource
+import java.nio.file.Files
 import java.nio.file.Path
-import java.time.Instant
 import java.time.OffsetDateTime
+import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
-import java.util.TimeZone
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
+import kotlin.io.path.absolute
 import kotlin.io.path.absolutePathString
+import kotlin.io.path.createDirectories
+import kotlin.io.path.exists
 
-class BackupManager (
-    val instanceName: String
-) {
-    val snapshotPath: Path = Path.of(DatabaseDaemon.Companion.config.backupRoot, instanceName)
-    private val logicalBackups: MutableMap<String, BackupNode> = mutableMapOf()
-    private var physicalBackups: MutableMap<String, PhysicalBackupData>
-        = obtainPhysicalBackup().associateBy { it.label }.toMutableMap()
-    private var rootNode: BackupNode? = null
-    private var logicalPreviousNode: BackupNode? = null
+/**
+ * Logical (per-database) backups of one instance.
+ *
+ * Instances are databases inside one cluster, so a physical copy of a data
+ * directory would capture every instance at once. `pg_dump` in custom format is
+ * the operation that matches the model: one file per backup, restored with
+ * `pg_restore` into the instance database.
+ *
+ * Every backup is a full dump — incremental levels needed a cluster to diff
+ * against. The manifest lives next to the files, so a backup set can be copied
+ * or inspected without a database.
+ */
+class BackupManager (val instanceName: String) {
 
-    private val backupDirectory: Path get() = Path.of(config.backupRoot, instanceName)
-    private val backupDataSource: PGSimpleDataSource
+    /** One entry in the manifest, and one node in the list the UI renders. */
+    data class BackupEntry(
+        val label: String,
+        val alias: String? = null,
+        val description: String? = null,
+        val createdAt: String,
+        val sizeBytes: Long = 0,
+    )
 
     data class BackupNode(
         val label: String,
@@ -41,711 +53,185 @@ class BackupManager (
         val parent: String?,
         val backupType: BackupType,
         val createdAt: OffsetDateTime,
-        val children: MutableList<BackupNode> = mutableListOf()
+        val children: MutableList<BackupNode> = mutableListOf(),
     )
 
     object BackupNodeSerializer: JsonSerializer<BackupNode>() {
         override fun serialize(
-            node: BackupNode,
-            generator: JsonGenerator,
-            provider: SerializerProvider
+            value: BackupNode, gen: JsonGenerator, serializers: SerializerProvider
         ) {
-            generator.writeStartObject()
-            generator.writeStringField("label", node.label)
-            generator.writeBooleanField("isExpired", node.isExpired)
-            generator.writeStringField("alias", node.alias)
-            generator.writeStringField("description", node.description)
-            generator.writeStringField("parent", node.parent)
-            generator.writeStringField("backupType", node.backupType.name)
-            generator.writeNumberField("createdAt", node.createdAt.toInstant().toEpochMilli())
-            generator.writeArrayFieldStart("children")
-            node.children.forEach {
-                generator.writeString(it.label)
-            }
-            generator.writeEndArray()
-            generator.writeEndObject()
+            gen.writeStartObject()
+            gen.writeStringField("label", value.label)
+            gen.writeBooleanField("isExpired", value.isExpired)
+            gen.writeStringField("alias", value.alias)
+            gen.writeStringField("description", value.description)
+            gen.writeStringField("parent", value.parent)
+            gen.writeStringField("backupType", value.backupType.name)
+            gen.writeStringField("createdAt", value.createdAt.toString())
+            gen.writeArrayFieldStart("children")
+            value.children.forEach { serialize(it, gen, serializers) }
+            gen.writeEndArray()
+            gen.writeEndObject()
         }
     }
 
-    enum class BackupType {
-        FULL, DIFF, INCR
-    }
+    enum class BackupType { FULL, DIFF, INCR }
 
-    data class BackupTree(
-        val rootNodes: List<BackupNode>
-    )
+    private val backupDirectory: Path
+        get() = Path.of(config.backupRoot, instanceName).absolute()
 
-    init {
-        if (!snapshotPath.toFile().exists())
-            snapshotPath.toFile().mkdirs()
+    private val manifestFile: Path
+        get() = backupDirectory.resolve("manifest.json")
 
-        // The bookkeeping databases (backup repository metadata + backup tree)
-        // live in the *system* PostgreSQL cluster on localhost. They are
-        // provisioned by the deployment (see `backup_db_init.sql`) with a
-        // password that is supplied at deploy time — this code has no
-        // hard-coded fallback, so a misconfigured daemon fails loudly instead
-        // of silently connecting with a well-known credential.
-        val password = config.resolvedDbPassword
-        check(password.isNotBlank()) {
-            "No password for the database cluster. Set `dbPassword` in the " +
-                "daemon config file, or export AKIBA_DB_PASSWORD before starting the daemon."
-        }
-        backupDataSource = PGSimpleDataSource().apply {
-            setServerName(config.dbHost)
-            setPortNumber(config.dbPort)
-            setDatabaseName(config.backupDbName)
-            user = config.dbUser
-            setPassword(password)
-        }
-
-        updateLogicalData()
-        checkConsistency()
-    }
-
-    /**
-     * Check if the backup tree is valid
-     */
-    @Throws(IllegalStateException::class)
-    private fun checkConsistency() {
-        // There are several things we need to confirm
-
-        rootNode ?.let {
-            check(logicalPreviousNode != null) { "No previous backup found" }
-
-            // 1. The logical backup tree stored in our database SHOULD BE a tree
-            check(checkNoRing(mutableSetOf(), it)) {
-                "Bad backup tree structure, contact your administrator to check backup data"
-            }
-
-            // 2. All backups found in the database should be existent in the disk
-            checkDiskConsistency()
-
-            // 3. All aliases of backups should be unique
-            check(checkAliasUnique()) {
-                "Backup alias is not unique, please check your backup data"
-            }
-        }
-    }
-
-    /**
-     * Check if there is a ring in the backup tree. Use DFS to check
-     */
-    private fun checkNoRing(visited: MutableSet<String> = mutableSetOf(), node: BackupNode): Boolean {
-        if (visited.contains(node.label))
-            return false
-        visited.add(node.label)
-        for (child in node.children) {
-            if (!checkNoRing(visited, child))
-                return false
-        }
-        return true
-    }
-
-    @Throws(IllegalStateException::class)
-    private fun checkDiskConsistency() {
-        // a. We cannot allow there exists any backup in the tree that is not in the disk
-        val noPhysical: List<String> = logicalBackups.map { it.key }.minus(physicalBackups.keys)
-        if (noPhysical.isNotEmpty()) {
-            throw IllegalStateException(
-                "Backup tree is inconsistent, please check your backup data. " +
-                        "The following backups are missing in the disk: ${noPhysical.joinToString(", ")}"
-            )
-        }
-
-        // b. We cannot allow there exists any backup that has different types in the database and the disk
-        // Because we do not know which one is right, we cannot fix the data automatically
-        val typeErrors: MutableSet<String> = mutableSetOf()
-        physicalBackups.values.forEach {
-            if (it.type != logicalBackups[it.label]!!.backupType)
-                typeErrors.add(it.label)
-        }
-        if (typeErrors.isNotEmpty()) {
-            throw IllegalStateException(
-                "Backup tree is inconsistent, please check your backup data. " +
-                        "The following backups have wrong type: ${typeErrors.joinToString(", ")}"
-            )
-        }
-
-        // c. We cannot allow there exists any backup in the disk that is not in the tree
-        // TODO: To automatically fix the database data according to output of `pgbackrest info`
-        val noLogical = physicalBackups.keys.minus(logicalBackups.map { it.key })
-        if (noLogical.isNotEmpty()) {
-            throw IllegalStateException(
-                "Backup tree is inconsistent, please check your backup data. " +
-                        "The following backups are missing in the database: ${noLogical.joinToString(", ")}"
-            )
-        }
-    }
-
-    private fun checkAliasUnique(): Boolean {
-        return logicalBackups.values.mapNotNull { it.alias }.size == logicalBackups.values.mapNotNull { it.alias }.distinct().size
-    }
-
-    /**
-     * Get snapshot data stored in database. WON'T check if the backup tree is valid.
-     *
-     * @return Root node of backup tree
-     */
-    @Throws(IllegalStateException::class)
-    private fun updateLogicalData() {
-        backupDataSource.connection.use { conn ->
-            conn.prepareStatement("""
-                SELECT label, is_expired, parent, backup_alias, description, backup_type, created_at
-                FROM db_backup_tree
-                WHERE instance_name = ?
-            """.trimIndent()).use { stmt ->
-                stmt.setString(1, instanceName)
-                val rs = stmt.executeQuery()
-                while (rs.next()) {
-                    val node = BackupNode(
-                        label = rs.getString("label"),
-                        isExpired = rs.getBoolean("is_expired"),
-                        alias = rs.getString("backup_alias"),
-                        description = rs.getString("description"),
-                        parent = rs.getString("parent"),
-                        backupType = BackupType.valueOf(rs.getString("backup_type")),
-                        createdAt = rs.getObject("created_at", OffsetDateTime::class.java)
-                    )
-                    logicalBackups[node.label] = node
-                }
-            }
-        }
-
-        if (logicalBackups.isEmpty()) {
-            globalLogger.warn("No snapshot found, creating your first snapshot is highly recommended")
-            return
-        }
-
-        logicalBackups.forEach { (_, node) ->
-            if (node.backupType == BackupType.FULL)
-                return@forEach
-            val parent = logicalBackups[node.parent]
-                ?: throw IllegalStateException(
-                    "Database logical error: Parent of ${node.label} (${node.parent}) not found")
-            parent.children.add(node)
-        }
-
-        rootNode = logicalBackups.values.filter { it.parent == null && !it.isExpired }.maxBy { it.createdAt }
-        logicalPreviousNode = logicalBackups[PGInstances.instances[instanceName]!!.logicalPrior]
-            ?: logicalBackups.values.maxBy { it.createdAt }
-    }
-
-    /**
-     * List the backups that are still **available** for [instanceName] — the
-     * ones a restore can actually target.
-     *
-     * This is what `/backup/peek` returns and what the UI shows when the user
-     * picks a backup to restore. It used to select `is_expired = true`, i.e. the
-     * backups that can no longer be restored (and which the housekeeping pass
-     * deletes outright), so the list came back empty on every deployment.
-     */
-    fun getLogicalData(): List<BackupNode> {
-        val nodes: MutableList<BackupNode> = mutableListOf()
-
-        backupDataSource.connection.use { conn ->
-            conn.prepareStatement("""
-                SELECT label, parent, backup_alias, description, backup_type, created_at, is_expired
-                FROM db_backup_tree
-                WHERE instance_name = ? AND is_expired = false
-                ORDER BY created_at
-            """.trimIndent()).use { stmt ->
-                stmt.setString(1, instanceName)
-                val rs = stmt.executeQuery()
-                while (rs.next()) {
-                    nodes.add(BackupNode(
-                        label = rs.getString("label"),
-                        isExpired = rs.getBoolean("is_expired"),
-                        alias = rs.getString("backup_alias"),
-                        description = rs.getString("description"),
-                        parent = rs.getString("parent"),
-                        backupType = BackupType.valueOf(rs.getString("backup_type")),
-                        createdAt = rs.getObject("created_at", OffsetDateTime::class.java)
-                    ))
-                }
-            }
-        }
-
-        return nodes
-    }
-
-    private data class PhysicalBackupData(
-        val label: String,
-        val prior: String?,
-        val type: BackupType,
-        val startTimestamp: OffsetDateTime,
-        val stopTimestamp: OffsetDateTime
-    )
-
-    /**
-     * Get physical backup data in the disk
-     *
-     * Here is an example of `pgbackdata info` output:
-     *
-     * ```json
-     * [
-     *   {
-     *     "archive": [
-     *       {
-     *         "database": { "id": 1, "repo-key": 1 },
-     *         "id": "16-1",
-     *         "max": "00000001000000000000000B",
-     *         "min": "000000010000000000000001"
-     *       }
-     *     ],
-     *     "backup": [
-     *       {
-     *         "archive": { "start": "000000010000000000000003", "stop": "000000010000000000000003" },
-     *         "backrest": { "format": 5, "version": "2.50" },
-     *         "database": { "id": 1, "repo-key": 1 },
-     *         "error": false,
-     *         "info": { "delta": 31049162, "repository": { "delta": 4106998, "size": 4106998 }, "size": 31049162 },
-     *         "label": "20260104-142406F",
-     *         "lsn": { "start": "0/3000060", "stop": "0/3000170" },
-     *         "prior": null,
-     *         "reference": null,
-     *         "timestamp": { "start": 1767507846, "stop": 1767507910 },
-     *         "type": "full"
-     *       }
-     *     ],
-     *     "cipher": "none",
-     *     "db": [ { "id": 1, "repo-key": 1, "system-id": 7591364124800804000, "version": "16" } ],
-     *     "name": "test",
-     *     "repo": [
-     *       { "cipher": "none", "key": 1, "status": { "code": 0, "message": "ok" } }
-     *     ],
-     *     "status": { "code": 0, "lock": { "backup": { "held": false } }, "message": "ok" }
-     *   }
-     * ]
-     * ```
-     *
-     * What we want is every 'label', 'prior', 'type' in "backup".
-     */
-    private fun obtainPhysicalBackup(): MutableSet<PhysicalBackupData> {
-        val backups = mutableSetOf<PhysicalBackupData>()
-        val cmd = """
-            sudo -u postgres pgbackrest --stanza=${instanceName} \
-                --config=${backupDirectory.absolutePathString()}/pgbackrest.conf \
-                --output=json info
-        """.trimIndent()
-        val process = ProcessBuilder("bash", "-c", cmd).redirectErrorStream(true).start()
-        process.waitFor()
-        if (process.exitValue() != 0)
-            globalLogger.error("Failed to obtain physical backup data: " +
-                process.inputStream.bufferedReader().readText()
-            )
-
-        val json = jacksonObjectMapper().readTree(process.inputStream.bufferedReader().readText())
-        val backupNodes = json.at("/0/backup")
-        for (node in backupNodes) { backups.add(parseBackupNode(node)) }
-
-        return backups
-    }
-
-    /**
-     * Create a backup
-     *
-     * @param alias The alias of the backup
-     * @param description The description of the backup
-     * @param isFull Whether to create a full backup
-     */
-    @Throws(IllegalStateException::class)
-    /**
-     * Physical backups were tied to a per-instance PostgreSQL cluster.
-     *
-     * Instances are databases in the deployment's shared cluster now, so a
-     * pgbackrest stanza per instance no longer describes anything: the data
-     * directory it would copy belongs to every instance at once. Backup and
-     * restore stay disabled until they are reimplemented as logical dumps
-     * (`pg_dump` / `pg_restore` per instance database) — failing here is better
-     * than writing a stanza that silently covers the wrong scope.
-     */
-    private fun requireBackupMode() {
-        throw IllegalStateException(
-            "Physical backups are unavailable in single-cluster mode: instance " +
-                "'$instanceName' is a database, not a cluster. Backup needs the " +
-                "pg_dump-based rewrite before it can be enabled again."
-        )
-    }
-
+    /** Create a backup and return its label. */
+    @Throws(BackupInProgressException::class, IllegalStateException::class)
     fun backup(alias: String? = null, description: String? = null, isFull: Boolean = false): String {
-        requireBackupMode()
-        // Fail fast rather than queue: a second concurrent run cannot do anything
-        // useful (pgBackRest holds its own repository lock), and the caller needs
-        // to know that a backup is already running.
-        val lock = backupLock
+        val lock = lockFor(instanceName)
         if (!lock.tryLock()) throw BackupInProgressException(instanceName)
         try {
-            return if (isFull) createFullBackup(alias, description)
-                   else createAugmentedBackup(alias, description)
-        } finally {
-            lock.unlock()
-        }
-    }
+            backupDirectory.createDirectories()
+            val label = nextLabel()
+            val target = backupDirectory.resolve("$label.dump")
 
-    private fun checkPgbackrest(): Boolean {
-        globalLogger.info("Checking pgbackrest for instance $instanceName")
-
-        val cmd = """
-            sudo -u postgres pgbackrest \
-            --config=${backupDirectory.absolutePathString()}/pgbackrest.conf \
-            --stanza=$instanceName check
-        """.trimIndent()
-        val process = ProcessBuilder("bash", "-c", cmd).redirectErrorStream(true).start()
-        process.waitFor()
-
-        if (process.exitValue() != 0)
-            globalLogger.warn("""
-                pgbackrest for $instanceName not ready. Process output:
-                ${process.inputStream.bufferedReader().readText()}
-            """.trimIndent())
-        return process.exitValue() == 0
-    }
-
-    /**
-     * Serializes backup/restore work for this instance **across every
-     * BackupManager of that instance**.
-     *
-     * This used to be a plain instance field, and callers construct a *new*
-     * BackupManager per request (`operations/Backups.kt` does `BackupManager(name)`
-     * for every backup, peek and restore) — so two concurrent requests each held
-     * their own lock, both started pgBackRest, and the loser died on pgBackRest's
-     * own repository lock:
-     *
-     *     ERROR: [050]: unable to acquire lock on file '/tmp/pgbackrest/<stanza>-backup-1.lock'
-     *
-     * which reached the UI as a bare HTTP 500. The lock is therefore shared per
-     * instance name. `ReentrantLock` keeps the nested acquisitions
-     * ([backup] → [createFullBackup], [restoreBackup]) working, and
-     * [BackupInProgressException] lets a second caller fail fast with something
-     * actionable instead of hanging for a minute.
-     */
-    private val backupLock: ReentrantLock get() = lockFor(instanceName)
-
-    /**
-     * Translate a failed pgBackRest run into an exception, recognising the
-     * repository-lock error.
-     *
-     * The in-process lock above is the primary guard; this catches a pgBackRest
-     * started outside this daemon (a manual command, a leftover process, or a
-     * second daemon using the same repository), which would otherwise surface as
-     * an opaque internal error.
-     */
-    private fun pgbackrestFailure(operation: String, output: String): IllegalStateException {
-        val lockError = output.contains("unable to acquire lock", ignoreCase = true) ||
-            output.contains("another pgBackRest process", ignoreCase = true)
-        return if (lockError) {
-            globalLogger.warn("pgBackRest is busy with instance $instanceName: ${output.trim()}")
-            BackupInProgressException(instanceName)
-        } else {
-            IllegalStateException(
-                "Error occurred while creating $operation backup for instance $instanceName. " +
-                    "Process output:\n$output")
-        }
-    }
-
-    /**
-     * Create a full backup in the disk.
-     *
-     * According to pgbackrest's features, when a full backup is expired, all diff / incr backups affiliated
-     * will be deleted. So after creating this backup, we need to check current backup status through
-     * `pgbackrest info` to check if there are any expired backups, and adjust our backup tree.
-     *
-     * @param alias The alias of the backup
-     * @param description The description of the backup
-     * @return The label of the backup
-     */
-    @Throws(IllegalStateException::class)
-    private fun createFullBackup(alias: String? = null, description: String? = null): String {
-        backupLock.withLock {
-            // Check for pgbackrest need to keep the instance running
-            if (!PGInstances.instanceIsOn(instanceName))
-                PGInstances.startInstance(instanceName)
-
-            if (!checkPgbackrest())
-                throw IllegalStateException("pgbackrest for instance $instanceName not ready")
-
-            globalLogger.info("Creating FULL backup for instance $instanceName")
-
-            val cmd = """
-                sudo -u postgres pgbackrest --stanza=${instanceName} \
-                    --config=${backupDirectory.absolutePathString()}/pgbackrest.conf \
-                    --type=full --log-level-console=info backup
-            """.trimIndent()
-            val process = ProcessBuilder("bash", "-c", cmd).redirectErrorStream(true).start()
-            process.waitFor()
-
-            // Check process exit code
-            if (process.exitValue() != 0)
-                throw pgbackrestFailure("FULL", process.inputStream.bufferedReader().readText())
-
-            // Update database
-
-            val physicalBackups = obtainPhysicalBackup()
-            val lastFullBackup: PhysicalBackupData = physicalBackups.maxBy { it.startTimestamp }
-            check(lastFullBackup.type == BackupType.FULL) { "Last backup is not a FULL backup" }
-
-            // In extreme conditions (repo1-retention-full=1), the prior backup may be deleted, we need to check it
-            if (physicalBackups.find { it.label == PGInstances.instances[instanceName]!!.logicalPrior} == null)
-                PGInstances.instances[instanceName]!!.logicalPrior = null
-
-            globalLogger.info("Creating FULL backup for instance $instanceName (${lastFullBackup.label}) completed")
-
-            // Update database
-            backupDataSource.connection.use { conn ->
-                conn.prepareStatement("""
-                    INSERT INTO db_backup_tree 
-                    (instance_name, label, parent, backup_alias, description, backup_type, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """.trimIndent()).use { stmt ->
-                    stmt.setString(1, instanceName)
-                    stmt.setString(2, lastFullBackup.label)
-                    stmt.setString(3, PGInstances.instances[instanceName]!!.logicalPrior)
-                    stmt.setString(4, alias)
-                    stmt.setString(5, description)
-                    stmt.setString(6, BackupType.FULL.name)
-                    stmt.setObject(7, lastFullBackup.startTimestamp)
-                    stmt.executeUpdate()
-                }
-            }
-
-            // If there is any backup expired, mark them in the database
-            // TODO: Here we only check if there are labels that don't exist in the disk. Is it ok?
-            backupDataSource.connection.use { conn ->
-                conn.prepareStatement("""
-                    UPDATE db_backup_tree SET is_expired = true
-                    WHERE instance_name = '$instanceName'
-                        AND label NOT IN (${physicalBackups.joinToString(", ") { "'${it.label}'" }})
-                """.trimIndent()).use { stmt ->
-                    stmt.executeUpdate()
-                }
-            }
-
-            // Delete expired backups in database
-            backupDataSource.connection.use { conn ->
-                conn.prepareStatement("""
-                    DELETE FROM db_backup_tree
-                    WHERE is_expired = true
-                """.trimIndent()).use { stmt ->
-                    stmt.executeUpdate()
-                }
-            }
-
-            PGInstances.instances[instanceName]!!.logicalPrior = lastFullBackup.label
-            globalLogger.info("Database updated for instance $instanceName")
-
-            // Update logical backup tree at once
-            updateLogicalData()
-
-            return lastFullBackup.label
-        }
-    }
-
-    /**
-     * Create an augmented backup in the disk. If we just performed a restoration to a non-latest backup
-     * and haven't done any backup, that means that we need to create a DIFF backup after the latest FULL backup.
-     * Else, we need to create an INCR backup after the latest backup.
-     */
-    @Throws(IllegalStateException::class)
-    private fun createAugmentedBackup(alias: String? = null, description: String? = null): String {
-        backupLock.withLock {
-            // Check for pgbackrest need to keep the instance running
-            if (!PGInstances.instanceIsOn(instanceName))
-                PGInstances.startInstance(instanceName)
-
-            if (!checkPgbackrest())
-                throw IllegalStateException("pgbackrest for instance $instanceName not ready")
-
-            var physicalBackups = obtainPhysicalBackup()
-            val lastBackup: PhysicalBackupData = physicalBackups.maxBy { it.startTimestamp }
-            val logicPrior = PGInstances.instances[instanceName]!!.logicalPrior
-            // If the logical prior backup is not the latest backup, that indicates that we just restored the data
-            // with no backup ahead. In this case, we should create a DIFF backup instead.
-            val backupType = if (logicPrior != lastBackup.label) BackupType.DIFF else BackupType.INCR
-
-            globalLogger.info("Creating ${backupType.name} backup for instance $instanceName")
-
-            val cmd = """
-                sudo -u postgres pgbackrest --stanza=${instanceName} \
-                    --config=${backupDirectory.absolutePathString()}/pgbackrest.conf \
-                    --type=${backupType.name.lowercase()} --log-level-console=info backup
-            """.trimIndent()
-            val process = ProcessBuilder("bash", "-c", cmd).redirectErrorStream(true).start()
-            process.waitFor()
-
-            // Check process exit code
-            if (process.exitValue() != 0)
-                throw pgbackrestFailure(
-                    backupType.name, process.inputStream.bufferedReader().readText())
-
-            val thisBackup = obtainPhysicalBackup().maxBy { it.startTimestamp }
-            globalLogger.info(
-                "Creating ${backupType.name} backup for instance $instanceName (${thisBackup.label}) completed")
-
-            backupDataSource.connection.use { conn ->
-                conn.prepareStatement("""
-                    INSERT INTO db_backup_tree 
-                    (instance_name, label, parent, backup_alias, description, backup_type, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """.trimIndent()).use { stmt ->
-                    stmt.setString(1, instanceName)
-                    stmt.setString(2, thisBackup.label)
-                    stmt.setString(3, PGInstances.instances[instanceName]!!.logicalPrior)
-                    stmt.setString(4, alias)
-                    stmt.setString(5, description)
-                    stmt.setString(6, backupType.name)
-                    stmt.setObject(7, thisBackup.startTimestamp)
-                    stmt.executeUpdate()
-                }
-            }
-            PGInstances.instances[instanceName]!!.logicalPrior = thisBackup.label
-
-            // Update logical backup tree
-            val thisNode = BackupNode(
-                label = thisBackup.label,
-                isExpired = false,
-                alias = alias,
-                description = description,
-                parent = logicPrior,
-                backupType = backupType,
-                createdAt = thisBackup.startTimestamp
+            run(
+                command = listOf(
+                    pgBin("pg_dump"), "-Fc", "--no-owner", "--no-privileges",
+                    "-h", config.dbHost, "-p", config.dbPort.toString(),
+                    "-U", config.dbUser, "-d", PGInstances.databaseName(instanceName),
+                    "-f", target.absolutePathString(),
+                ),
+                operation = "FULL backup",
+                target = target,
             )
-            logicalBackups[logicPrior]!!.children.add(thisNode)
-            logicalBackups[thisBackup.label] = thisNode
 
-            return thisBackup.label
-        }
-    }
-
-    @Throws(IllegalArgumentException::class)
-    fun restoreBackup(labelOrAlias: String) {
-        requireBackupMode()
-        // Same fast-fail as [backup]: a restore must not overlap a backup of the
-        // same instance, and the caller should hear about it immediately.
-        val lock = backupLock
-        if (!lock.tryLock()) throw BackupInProgressException(instanceName)
-        try {
-        lock.withLock {
-            val target = findBackup(labelOrAlias)
-                ?: throw IllegalArgumentException("Backup $labelOrAlias not found in the database")
-            if (target.isExpired) throw IllegalArgumentException("Backup $labelOrAlias is already expired")
-
-
-            // Confirm again if this backup exists in the disk
-            val physicalTarget = findBackupInDisk(target.label)
-                ?: throw IllegalArgumentException("Backup $labelOrAlias not found in the disk")
-
-            // When performing restoration, there should be no lock occupied for this instance
-            if (PGInstances.tokenSessions.instanceIsInUse(instanceName))
-                throw IllegalStateException("""
-                    Instance $instanceName is in use. Please wait for the current operation to finish.
-                """.trimIndent())
-
-            // Perform physical restoration
-            // 1. We need to stop the instance first
-            if (PGInstances.instanceIsOn(instanceName))
-                PGInstances.shutdownInstance(instanceName)
-
-            // 2. Restore
-            // Using --type=immediate (replay WAL only as far as needed for the backup to be
-            // self-consistent) plus --target-action=promote so that, once PostgreSQL reaches
-            // the recovery target, it automatically promotes the cluster out of recovery and
-            // accepts read-write transactions. Without --target-action=promote, PG 12+
-            // defaults to `recovery_target_action = pause`, which leaves the cluster in
-            // hot-standby / read-only mode forever — every subsequent CREATE TABLE / INSERT
-            // (e.g. AkibaExample4 creating its result table at runtime in test_run.sh
-            // Step 12) would fail with `cannot execute CREATE TABLE in a read-only
-            // transaction`. The same recovery_target settings are persisted to
-            // postgresql.auto.conf by pgbackrest and will be honoured on every later start
-            // until they're cleared by a successful promotion, which `--target-action=promote`
-            // accomplishes on this very recovery pass.
-            val cmd = """
-                sudo -u postgres pgbackrest --stanza=${instanceName} \
-                --config=${backupDirectory.absolutePathString()}/pgbackrest.conf \
-                --delta --type=immediate --target-action=promote --set=${target.label} restore
-            """.trimIndent()
-            globalLogger.info("Restore command: $cmd")
-            val process = ProcessBuilder("bash", "-c", cmd).redirectErrorStream(true).start()
-            process.waitFor()
-
-            if (process.exitValue() != 0)
-                throw IllegalStateException("""
-                    Error occurred while restoring backup $labelOrAlias for instance $instanceName. Process output:
-                    ${process.inputStream.bufferedReader().readText()}
-                """.trimIndent())
-
-            // 3. Restart the instance, to make the instance backup-able again
-            // postgresql needed to read recovery.signal (although it may be empty) after restoration, or it will
-            // refuse to start
-            PGInstances.startInstance(instanceName)
-
-            // 3b. Defence-in-depth: a restore that did not promote leaves the
-            //     cluster read-only. The daemon no longer owns the cluster — the
-            //     deployment starts it — so it can only wait and report instead of
-            //     calling `pg_ctl promote` on a data directory it does not have.
-            try {
-                val maxAttempts = 10
-                var attempt = 0
-                while (attempt < maxAttempts && PGInstances.instanceIsInRecovery(instanceName)) {
-                    Thread.sleep(200)
-                    attempt++
-                }
-                if (PGInstances.instanceIsInRecovery(instanceName)) {
-                    globalLogger.warn(
-                        "Instance $instanceName is still in recovery after $maxAttempts promote attempts; " +
-                        "subsequent writes (CREATE TABLE / INSERT) will fail with " +
-                        "`cannot execute ... in a read-only transaction`."
-                    )
-                }
-            } catch (e: Exception) {
-                globalLogger.warn("Promote fallback failed for $instanceName: ${e.message}")
-            }
-
-            PGInstances.shutdownInstance(instanceName)
-
-            // 4. Update the logical prior backup
-            PGInstances.instances[instanceName]!!.logicalPrior = target.label
-        }
+            val entries = readManifest().toMutableList()
+            entries.add(
+                BackupEntry(
+                    label = label,
+                    alias = alias?.takeIf { it.isNotBlank() },
+                    description = description?.takeIf { it.isNotBlank() },
+                    createdAt = OffsetDateTime.now(ZoneOffset.UTC).toString(),
+                    sizeBytes = Files.size(target),
+                )
+            )
+            writeManifest(entries)
+            globalLogger.info("Backup $label of instance $instanceName written to $target")
+            return label
         } finally {
             lock.unlock()
         }
     }
 
-    private fun findBackup(labelOrAlias: String): BackupNode? {
-        logicalBackups[labelOrAlias] ?.let { return it }
-        logicalBackups.values.find { it.alias == labelOrAlias } ?.let { return it }
-        return null
+    /** Restore the backup named by label or alias into the instance database. */
+    @Throws(BackupInProgressException::class, IllegalStateException::class)
+    fun restoreBackup(labelOrAlias: String) {
+        val lock = lockFor(instanceName)
+        if (!lock.tryLock()) throw BackupInProgressException(instanceName)
+        try {
+            val entry = readManifest().lastOrNull { it.label == labelOrAlias || it.alias == labelOrAlias }
+                ?: throw IllegalStateException(
+                    "No backup '$labelOrAlias' for instance $instanceName")
+            val source = backupDirectory.resolve("${entry.label}.dump")
+            if (!source.exists())
+                throw IllegalStateException("Backup file of ${entry.label} is missing: $source")
+
+            run(
+                command = listOf(
+                    pgBin("pg_restore"), "--clean", "--if-exists", "--no-owner",
+                    "-h", config.dbHost, "-p", config.dbPort.toString(),
+                    "-U", config.dbUser, "-d", PGInstances.databaseName(instanceName),
+                    source.absolutePathString(),
+                ),
+                operation = "restore of ${entry.label}",
+                target = null,
+            )
+            globalLogger.info("Restored ${entry.label} into instance $instanceName")
+        } finally {
+            lock.unlock()
+        }
     }
 
+    /** Backups of this instance, newest first, as flat nodes. */
+    fun getLogicalData(): List<BackupNode> =
+        readManifest()
+            .sortedByDescending { it.createdAt }
+            .map { entry ->
+                BackupNode(
+                    label = entry.label,
+                    isExpired = false,
+                    alias = entry.alias,
+                    description = entry.description,
+                    parent = null,
+                    backupType = BackupType.FULL,
+                    createdAt = runCatching { OffsetDateTime.parse(entry.createdAt) }
+                        .getOrDefault(OffsetDateTime.now(ZoneOffset.UTC)),
+                )
+            }
+
+    private fun pgBin(tool: String): String =
+        Path.of(config.pgBinDirectory, tool).absolutePathString()
+
     /**
-     * Find a backup in the disk using `pgbackrest info` command
-     *
-     * @param label The backup label
-     * @return The backup data
+     * Run a pg tool and turn a non-zero exit into an exception carrying its
+     * stderr, so the route can report why a backup failed.
      */
-    @Throws(IllegalStateException::class)
-    private fun findBackupInDisk(label: String): PhysicalBackupData? {
-        val cmd = """
-            sudo -u postgres pgbackrest --stanza=${instanceName} \
-                --config=${backupDirectory.absolutePathString()}/pgbackrest.conf \
-                --output=json --set=$label info
-        """.trimIndent()
-        val process = ProcessBuilder("bash", "-c", cmd).redirectErrorStream(true).start()
-        process.waitFor()
+    private fun run(command: List<String>, operation: String, target: Path?) {
+        val password = config.resolvedDbPassword
+        if (password.isBlank())
+            throw IllegalStateException(
+                "No password for the database cluster. Set `dbPassword` in the daemon " +
+                    "configuration or AKIBA_DB_PASSWORD in the environment."
+            )
 
-        if (process.exitValue() != 0)
-            throw IllegalStateException("""
-                Error occurred while querying backup $label for instance $instanceName. Process output:
-                ${process.inputStream.bufferedReader().readText()}
-            """.trimIndent())
+        val builder = ProcessBuilder(command).redirectErrorStream(true)
+        // pg_dump/pg_restore read the password from the environment; writing it to
+        // stdin would be ignored and they would block on a terminal prompt.
+        builder.environment()["PGPASSWORD"] = password
+        val process = builder.start()
+        val output = process.inputStream.bufferedReader().readText()
 
-        val json = jacksonObjectMapper().readTree(process.inputStream.bufferedReader().readText())
+        if (!process.waitFor(30, TimeUnit.MINUTES)) {
+            process.destroyForcibly()
+            target?.let { runCatching { Files.deleteIfExists(it) } }
+            throw IllegalStateException("$operation timed out after 30 minutes")
+        }
+        if (process.exitValue() != 0) {
+            target?.let { runCatching { Files.deleteIfExists(it) } }
+            globalLogger.error("pg tool failed during $operation: $output")
+            throw IllegalStateException(
+                "$operation failed (exit=${process.exitValue()}): " +
+                    output.lines().filter { it.isNotBlank() }.takeLast(3).joinToString(" | ")
+            )
+        }
+    }
 
-        val message = json.at("/0/status/message").textValue()
-        if (message == "requested backup not found")
-            return null
+    private fun nextLabel(): String {
+        val stamp = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss")
+            .withZone(ZoneOffset.UTC)
+            .format(java.time.Instant.now())
+        var label = stamp
+        var suffix = 1
+        while (backupDirectory.resolve("$label.dump").exists()) {
+            label = "$stamp-$suffix"
+            suffix++
+        }
+        return label
+    }
 
-        val backupNode = json.at("/0/backup/0")
-        return parseBackupNode(backupNode)
+    private fun readManifest(): List<BackupEntry> {
+        if (!manifestFile.exists()) return emptyList()
+        return runCatching {
+            jacksonObjectMapper().readValue<List<BackupEntry>>(manifestFile.toFile())
+        }.getOrElse { e ->
+            globalLogger.warn("Cannot read backup manifest of $instanceName: ${e.message}")
+            emptyList()
+        }
+    }
+
+    private fun writeManifest(entries: List<BackupEntry>) {
+        backupDirectory.createDirectories()
+        jacksonObjectMapper().writerWithDefaultPrettyPrinter()
+            .writeValue(manifestFile.toFile(), entries)
     }
 
     companion object {
@@ -753,78 +239,24 @@ class BackupManager (
          * Process-wide backup/restore locks, keyed by instance name.
          *
          * Shared on purpose: callers create a new BackupManager per request, so a
-         * per-object lock would not exclude anything — see [backupLock].
+         * per-object lock would not exclude anything — see [backup].
          */
         private val backupLocks = ConcurrentHashMap<String, ReentrantLock>()
 
         private fun lockFor(instanceName: String): ReentrantLock =
             backupLocks.computeIfAbsent(instanceName) { ReentrantLock() }
 
-        /**
-         * Whether a backup or restore of [instanceName] is running right now.
-         *
-         * Queried by the framework so the UI can disable "Back up" while a run is
-         * in progress — including runs started from another tab, the CLI, or the
-         * automatic snapshot after a write, not just the caller's own request.
-         */
+        /** Whether a backup or restore of [instanceName] is running right now. */
         fun isBackupRunning(instanceName: String): Boolean =
             backupLocks[instanceName]?.isLocked == true
 
         /** Instance names with a backup/restore in flight, for the UI to grey out. */
         fun busyInstances(): Set<String> =
             backupLocks.filterValues { it.isLocked }.keys.toSet()
-
-        @Throws(IllegalArgumentException::class)
-        private fun parseBackupNode(node: JsonNode): PhysicalBackupData {
-            val label = node.at("/label").let {
-                if (it.isMissingNode) throw IllegalArgumentException("Missing label.")
-                else it.textValue()
-            }
-            val prior = node.at("/prior").let {
-                if (it.isMissingNode) throw IllegalArgumentException("Missing prior.")
-                else it.textValue()
-            }
-            val type = BackupType.valueOf(node.at("/type").let {
-                if (it.isMissingNode) throw IllegalArgumentException("Missing type.")
-                else it.textValue().uppercase()
-            })
-            val startTimestamp = OffsetDateTime.ofInstant(
-                Instant.ofEpochSecond(node.at("/timestamp/start").let {
-                    if (it.isMissingNode) throw IllegalArgumentException("Missing timestamp/start.")
-                    else it.longValue()
-                }),
-                TimeZone.getDefault().toZoneId()
-            )
-            val stopTimestamp = OffsetDateTime.ofInstant(
-                Instant.ofEpochSecond(node.at("/timestamp/stop").let {
-                    if (it.isMissingNode) throw IllegalArgumentException("Missing timestamp/stop.")
-                    else it.longValue()
-                }),
-                TimeZone.getDefault().toZoneId()
-            )
-
-            return PhysicalBackupData(
-                label = label,
-                prior = prior,
-                type = type,
-                startTimestamp = startTimestamp,
-                stopTimestamp = stopTimestamp
-            )
-        }
     }
 }
 
-/**
- * Another backup or restore of the same instance is already running.
- *
- * An expected, user-triggerable condition — double-clicking "Back up", or a
- * snapshot racing a manual backup — not an internal failure: callers translate it
- * into a "busy, try again" answer (HTTP 409 / websocket close code 4409) rather
- * than a 500.
- *
- * Top-level on purpose: nested classes declared inside a companion object are not
- * reachable as `BackupManager.BackupInProgressException` from other files.
- */
+
 class BackupInProgressException(instanceName: String) : IllegalStateException(
     // Kept short: this text also travels as a websocket close reason, which
     // RFC 6455 caps at 123 bytes (see AbstractWebsocketRoute).
