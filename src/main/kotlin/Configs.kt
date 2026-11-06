@@ -61,8 +61,17 @@ data class Configs (
     val dbPassword: String = "",
     /** Instance databases are named `<prefix><instance>` to stay clear of system databases. */
     val instanceDatabasePrefix: String = "inst_",
-    /** Schema applied to every new instance database. */
-    val instanceSchemaFile: String = "resources/database_init.sql",
+    /**
+     * Schemas applied to every new instance database, in order.
+     *
+     * `database_init.sql` creates the analysis tables, `agent_database_init.sql`
+     * the agent session/memory tables — an instance without the second one cannot
+     * open a chat, which is exactly what the old init script applied both for.
+     */
+    val instanceSchemaFiles: List<String> = listOf(
+        "resources/database_init.sql",
+        "resources/agent_database_init.sql",
+    ),
     /** Bookkeeping database for the backup tree. */
     val backupDbName: String = "akiba_backup",
     val backupTreeDbName: String = "db_backup_tree",

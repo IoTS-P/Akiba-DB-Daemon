@@ -80,6 +80,14 @@ object PGInstances {
         } else
             mutableMapOf()
 
+        // An instance created before both schemas shipped (or by an older daemon)
+        // can be missing whole tables; re-applying the idempotent scripts costs
+        // milliseconds and is what makes an upgrade not require a fresh volume.
+        instances.keys.forEach { name ->
+            runCatching { applySchemas(databaseName(name)) }
+                .onFailure { globalLogger.warn("Could not ensure schema of instance $name: ${it.message}") }
+        }
+
         pgVer = runCatching {
             val getVer = ProcessBuilder("pg_config", "--version").start()
             getVer.waitFor()
@@ -207,29 +215,35 @@ object PGInstances {
      * database is a catalogue operation now, and the cluster itself is started
      * by the deployment, not by the daemon.
      */
+    /** Apply every configured schema to [database]; the scripts are idempotent. */
+    private fun applySchemas(database: String) {
+        val schemas = config.instanceSchemaFiles.map { name ->
+            val file = File(name)
+            if (!file.exists()) {
+                throw IllegalStateException(
+                    "Schema file not found at ${file.absolutePath} (working dir = " +
+                        "${File(".").absolutePath}). The akiba_db_daemon distribution must be " +
+                        "unpacked with its resources/ directory intact."
+                )
+            }
+            file.readText()
+        }
+        clusterConnection(database).use { conn ->
+            conn.createStatement().use { stmt -> schemas.forEach { stmt.execute(it) } }
+        }
+    }
+
     @Throws(IllegalStateException::class, IllegalArgumentException::class)
     private fun createPsqlInstance(userName: String, instanceName: String): InstanceMetadata {
         validateInstanceName(instanceName)
         val database = databaseName(instanceName)
-
-        val schemaFile = File(config.instanceSchemaFile)
-        if (!schemaFile.exists()) {
-            throw IllegalStateException(
-                "Schema file not found at ${schemaFile.absolutePath} (working dir = " +
-                    "${File(".").absolutePath}). The akiba_db_daemon distribution must be " +
-                    "unpacked with its resources/ directory intact."
-            )
-        }
-        val schema = schemaFile.readText()
 
         clusterConnection().use { conn ->
             conn.createStatement().use { stmt ->
                 stmt.executeUpdate("CREATE DATABASE \"$database\"")
             }
         }
-        clusterConnection(database).use { conn ->
-            conn.createStatement().use { stmt -> stmt.execute(schema) }
-        }
+        applySchemas(database)
         return InstanceMetadata(userName, null)
     }
 
