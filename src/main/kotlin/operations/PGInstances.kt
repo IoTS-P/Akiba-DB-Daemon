@@ -80,13 +80,12 @@ object PGInstances {
         } else
             mutableMapOf()
 
-        // An instance created before both schemas shipped (or by an older daemon)
-        // can be missing whole tables; re-applying the idempotent scripts costs
-        // milliseconds and is what makes an upgrade not require a fresh volume.
-        instances.keys.forEach { name ->
-            runCatching { applySchemas(databaseName(name)) }
-                .onFailure { globalLogger.warn("Could not ensure schema of instance $name: ${it.message}") }
-        }
+        // The instance map is only written on a clean shutdown, so a container
+        // restart can leave it empty while every database is still there. Rebuild
+        // the entries from the cluster and re-apply the idempotent schemas: that is
+        // what keeps an upgrade from needing a fresh volume.
+        runCatching { recoverFromCluster() }
+            .onFailure { globalLogger.warn("Instance recovery skipped: ${it.message}") }
 
         pgVer = runCatching {
             val getVer = ProcessBuilder("pg_config", "--version").start()
@@ -97,6 +96,37 @@ object PGInstances {
                 .trim()
                 .toInt()
         }.getOrDefault(-1)
+    }
+
+    /**
+     * Rebuild [instances] from the databases that exist and repair their schemas.
+     *
+     * With a single operator the recovered owner is the only name in the credential
+     * store; without one there is nothing to attribute the instance to, so the
+     * database is repaired but not registered.
+     */
+    private fun recoverFromCluster() {
+        val owner = UserStore.usernames().firstOrNull()
+        clusterConnection().use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.executeQuery(
+                    "SELECT datname FROM pg_database WHERE datname LIKE '${config.instanceDatabasePrefix}%'"
+                ).use { rs ->
+                    while (rs.next()) {
+                        val database = rs.getString(1)
+                        val name = database.removePrefix(config.instanceDatabasePrefix)
+                        if (instances[name] == null && owner != null) {
+                            instances[name] = InstanceMetadata(owner, null)
+                            globalLogger.info("Recovered instance '$name' from database '$database'")
+                        }
+                        runCatching { applySchemas(database) }
+                            .onFailure {
+                                globalLogger.warn("Schema repair of '$database' failed: ${it.message}")
+                            }
+                    }
+                }
+            }
+        }
     }
 
     /** Name of the database that holds [instanceName]. */
