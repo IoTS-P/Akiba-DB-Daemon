@@ -163,7 +163,7 @@ object AgentOps {
             fa.session.useDb { conn ->
                 conn.prepareStatement(
                     "SELECT session_id, session_name, status, binary_id, module_name, graph_id, " +
-                    "model_name, project_name, workflow_id, created_at, updated_at, resumed_at, completed_at, transcript, " +
+                    "model_name, project_name, current_program, workflow_id, created_at, updated_at, resumed_at, completed_at, transcript, " +
                     "parent_session_id, lifecycle, runtime_state, closing_reason " +
                     "FROM agent_sessions WHERE session_id = ?::uuid"
                 ).use { ps ->
@@ -179,6 +179,7 @@ object AgentOps {
                             "graphId" to rs.getUUIDStr("graph_id"),
                             "modelName" to rs.getString("model_name"),
                             "projectName" to rs.getString("project_name"),
+                            "currentProgram" to rs.getString("current_program"),
                             "workflowId" to rs.getString("workflow_id"),
                             "createdAt" to rs.getString("created_at"),
                             "updatedAt" to rs.getString("updated_at"),
@@ -233,6 +234,7 @@ object AgentOps {
                             "moduleName" to rs.getString("module_name"),
                             "modelName" to rs.getString("model_name"),
                             "projectName" to rs.getString("project_name"),
+                            "currentProgram" to rs.getString("current_program"),
                             "workflowId" to rs.getString("workflow_id"),
                             "createdAt" to rs.getString("created_at"),
                             "updatedAt" to rs.getString("updated_at"),
@@ -319,7 +321,7 @@ object AgentOps {
 
                 val where = if (conditions.isEmpty()) "" else "WHERE ${conditions.joinToString(" AND ")}"
                 val sql = "SELECT session_id, session_name, status, runtime_state, binary_id, module_name, " +
-                    "model_name, project_name, workflow_id, created_at, updated_at, parent_session_id " +
+                    "model_name, project_name, current_program, workflow_id, created_at, updated_at, parent_session_id " +
                     "FROM agent_sessions $where " +
                     "ORDER BY updated_at DESC LIMIT ? OFFSET ?"
 
@@ -460,7 +462,8 @@ object AgentOps {
             val sessionName: String? = null,
             val graphId: String? = null,
             val modelName: String? = null,
-            val transcript: String? = null
+            val transcript: String? = null,
+            val programName: String? = null
         )
 
         override suspend fun handle(ctx: RouteContext): Any? {
@@ -482,6 +485,7 @@ object AgentOps {
             req.graphId?.let { sets.add("graph_id = ?::uuid"); params.add(it) }
             req.modelName?.let { sets.add("model_name = ?"); params.add(it) }
             req.transcript?.let { sets.add("transcript = ?"); params.add(it) }
+            req.programName?.let { sets.add("current_program = ?"); params.add(it) }
 
             if (sets.isEmpty()) return HttpStatusCode.BadRequest.description("Nothing to update")
 
