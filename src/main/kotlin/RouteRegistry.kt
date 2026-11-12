@@ -81,11 +81,6 @@ object RouteRegistry {
         AgentOps.SaveContext,
         AgentOps.LoadContext,
 
-        AgentOps.CreateGraph,
-        AgentOps.AddGraphNode,
-        AgentOps.AddGraphEdge,
-        AgentOps.LoadGraph,
-
         AgentOps.RecordExecution,
         AgentOps.GetExecutions,
 

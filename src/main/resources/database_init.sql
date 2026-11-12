@@ -143,13 +143,18 @@ CREATE TABLE IF NOT EXISTS project_entries (
     name        TEXT NOT NULL,
     folder      BOOLEAN NOT NULL,
     size        BIGINT NOT NULL DEFAULT 0,
+    program_id  UUID,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (project_dir, path)
 );
+
+-- Idempotent migration for databases created before program identity existed.
+ALTER TABLE project_entries ADD COLUMN IF NOT EXISTS program_id UUID;
 
 SELECT assert_column_type('public', 'project_entries', 'project_dir', 'text');
 SELECT assert_column_type('public', 'project_entries', 'path', 'text');
 SELECT assert_column_type('public', 'project_entries', 'name', 'text');
 SELECT assert_column_type('public', 'project_entries', 'folder', 'bool');
 SELECT assert_column_type('public', 'project_entries', 'size', 'int8');
+SELECT assert_column_type('public', 'project_entries', 'program_id', 'uuid');
 SELECT assert_column_type('public', 'project_entries', 'updated_at', 'timestamptz');
