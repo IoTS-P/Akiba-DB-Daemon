@@ -282,36 +282,7 @@ SELECT assert_column_type('public', 'agent_session_contexts', 'module_data',    
 SELECT assert_column_type('public', 'agent_session_contexts', 'updated_at',     'timestamptz');
 
 -- ----------------------------------------------------------
--- 6. agent_graphs
---    Defines a directed graph topology for multi-agent
---    collaboration.  A graph is bound to a session and
---    describes which agents exist and how they are connected.
--- ----------------------------------------------------------
-CREATE TABLE IF NOT EXISTS agent_graphs (
-    graph_id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    session_id             UUID NOT NULL REFERENCES agent_sessions(session_id)
-                               ON DELETE CASCADE ON UPDATE CASCADE,
-    graph_name             TEXT,                          -- optional label
-    entry_node             TEXT,                          -- node_id of the entry point
-    max_iterations         INTEGER DEFAULT 10,            -- safety limit for cycle resolution
-    convergence_threshold  REAL DEFAULT 0.95,              -- for CONVERGENCE cycle strategy
-    cycle_strategy         TEXT NOT NULL DEFAULT 'MAX_ITERATIONS'
-                               CHECK (cycle_strategy IN ('MAX_ITERATIONS','CONVERGENCE','MANUAL')),
-    created_at             TIMESTAMPTZ NOT NULL DEFAULT now()
-);
 
-SELECT assert_column_type('public', 'agent_graphs', 'graph_id',              'uuid');
-SELECT assert_column_type('public', 'agent_graphs', 'session_id',            'uuid');
-SELECT assert_column_type('public', 'agent_graphs', 'graph_name',            'text');
-SELECT assert_column_type('public', 'agent_graphs', 'entry_node',            'text');
-SELECT assert_column_type('public', 'agent_graphs', 'max_iterations',        'int4');
-SELECT assert_column_type('public', 'agent_graphs', 'convergence_threshold', 'float4');
-SELECT assert_column_type('public', 'agent_graphs', 'cycle_strategy',        'text');
-SELECT assert_column_type('public', 'agent_graphs', 'created_at',            'timestamptz');
-
-CREATE INDEX IF NOT EXISTS idx_agent_graphs_session ON agent_graphs(session_id);
-
--- ----------------------------------------------------------
 -- 7. agent_graph_nodes
 --    Each node represents an agent within a graph.  The
 --    node's `role` determines how the graph engine routes

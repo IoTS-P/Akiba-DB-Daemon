@@ -72,9 +72,6 @@ data class Configs (
         "resources/database_init.sql",
         "resources/agent_database_init.sql",
     ),
-    /** Bookkeeping database for the backup tree. */
-    val backupDbName: String = "akiba_backup",
-    val backupTreeDbName: String = "db_backup_tree",
 ) {
     /** Resolved password for the cluster. Never a built-in default. */
     val resolvedDbPassword: String

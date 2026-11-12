@@ -176,7 +176,6 @@ object AgentOps {
                             "status" to rs.sessionRuntimeState(),
                             "binaryId" to rs.getObject("binary_id"),
                             "moduleName" to rs.getString("module_name"),
-                            "graphId" to rs.getUUIDStr("graph_id"),
                             "modelName" to rs.getString("model_name"),
                             "projectName" to rs.getString("project_name"),
                             "currentProgram" to rs.getString("current_program"),
@@ -525,7 +524,6 @@ object AgentOps {
             val sessionId: String,
             val status: String? = null,
             val sessionName: String? = null,
-            val graphId: String? = null,
             val modelName: String? = null,
             val transcript: String? = null,
             val programName: String? = null
@@ -547,7 +545,6 @@ object AgentOps {
 
             req.status?.let { sets.add("status = ?"); params.add(it) }
             req.sessionName?.let { sets.add("session_name = ?"); params.add(it) }
-            req.graphId?.let { sets.add("graph_id = ?::uuid"); params.add(it) }
             req.modelName?.let { sets.add("model_name = ?"); params.add(it) }
             req.transcript?.let { sets.add("transcript = ?"); params.add(it) }
             req.programName?.let { sets.add("current_program = ?"); params.add(it) }
