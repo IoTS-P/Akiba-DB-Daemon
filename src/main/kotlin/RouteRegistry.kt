@@ -78,12 +78,6 @@ object RouteRegistry {
         AgentOps.StoreMemory,
         AgentOps.QueryMemories,
 
-        AgentOps.SaveContext,
-        AgentOps.LoadContext,
-
-        AgentOps.RecordExecution,
-        AgentOps.GetExecutions,
-
         AgentOps.RequestHumanInput,
         AgentOps.RespondHumanInput,
         AgentOps.PollHumanInputs,

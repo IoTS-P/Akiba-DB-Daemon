@@ -126,35 +126,3 @@ SELECT assert_column_type('public', 'db_backup_tree', 'parent_id', 'uuid');
 SELECT assert_column_type('public', 'db_backup_tree', 'alias', 'text');
 SELECT assert_column_type('public', 'db_backup_tree', 'backup_type', 'text');
 SELECT assert_column_type('public', 'db_backup_tree', 'created_at', 'timestamptz');
-
--- Create table `project_entries` to index a Ghidra project's file tree.
---
--- The Projects browser reads this index instead of opening the project, because
--- a project that a running session holds cannot be opened a second time.
--- `project_dir` is the project's absolute path on disk, so equally named
--- projects in different instances keep separate trees; `path` is project
--- relative and `/`-separated, and folders carry `size` 0.
--- `ServerDatabase.initSchema()` declares the same table in the server database,
--- which is where the server's own index lives: the browser must answer with no
--- instance selected, so it cannot depend on an instance database being open.
-CREATE TABLE IF NOT EXISTS project_entries (
-    project_dir TEXT NOT NULL,
-    path        TEXT NOT NULL,
-    name        TEXT NOT NULL,
-    folder      BOOLEAN NOT NULL,
-    size        BIGINT NOT NULL DEFAULT 0,
-    program_id  UUID,
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (project_dir, path)
-);
-
--- Idempotent migration for databases created before program identity existed.
-ALTER TABLE project_entries ADD COLUMN IF NOT EXISTS program_id UUID;
-
-SELECT assert_column_type('public', 'project_entries', 'project_dir', 'text');
-SELECT assert_column_type('public', 'project_entries', 'path', 'text');
-SELECT assert_column_type('public', 'project_entries', 'name', 'text');
-SELECT assert_column_type('public', 'project_entries', 'folder', 'bool');
-SELECT assert_column_type('public', 'project_entries', 'size', 'int8');
-SELECT assert_column_type('public', 'project_entries', 'program_id', 'uuid');
-SELECT assert_column_type('public', 'project_entries', 'updated_at', 'timestamptz');
