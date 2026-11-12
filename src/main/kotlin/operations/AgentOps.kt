@@ -452,6 +452,71 @@ object AgentOps {
         }
     }
 
+    /** Sessions attached to one program of a project (used before moving it). */
+    object FindProjectSessions : AbstractPostRoute() {
+        override val path: String = "/agent/session/find"
+
+        data class Request(val project: String, val program: String? = null)
+
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val req = ctx.receive<Request>()
+            val fa = try { fastAccess(ctx) } catch (e: FastAccessException) { return e.code }
+            val results: MutableList<Map<String, Any?>> = mutableListOf()
+            fa.session.useDb { conn ->
+                val sql = if (req.program.isNullOrBlank()) {
+                    "SELECT session_id, session_name, current_program FROM agent_sessions WHERE project_name = ?"
+                } else {
+                    "SELECT session_id, session_name, current_program FROM agent_sessions " +
+                        "WHERE project_name = ? AND (current_program = ? OR current_program IS NULL)"
+                }
+                conn.prepareStatement(sql).use { ps ->
+                    ps.setString(1, req.project)
+                    if (!req.program.isNullOrBlank()) ps.setString(2, req.program)
+                    val rs = ps.executeQuery()
+                    while (rs.next()) {
+                        results.add(mapOf(
+                            "sessionId" to rs.getUUIDStr("session_id"),
+                            "sessionName" to rs.getString("session_name"),
+                            "currentProgram" to rs.getString("current_program"),
+                        ))
+                    }
+                }
+            }
+            return mapOf("sessions" to results)
+        }
+    }
+
+    /** Move sessions bound to a program onto another project/program. */
+    object RelocateSessions : AbstractPostRoute() {
+        override val path: String = "/agent/session/relocate"
+
+        data class Request(
+            val fromProject: String,
+            val program: String,
+            val toProject: String,
+            val newProgram: String,
+        )
+
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val req = ctx.receive<Request>()
+            val fa = try { fastAccess(ctx) } catch (e: FastAccessException) { return e.code }
+            var moved = 0
+            fa.session.useDb { conn ->
+                conn.prepareStatement(
+                    "UPDATE agent_sessions SET project_name = ?, current_program = ?, updated_at = now() " +
+                        "WHERE project_name = ? AND (current_program = ? OR current_program IS NULL)"
+                ).use { ps ->
+                    ps.setString(1, req.toProject)
+                    ps.setString(2, req.newProgram)
+                    ps.setString(3, req.fromProject)
+                    ps.setString(4, req.program)
+                    moved = ps.executeUpdate()
+                }
+            }
+            return mapOf("moved" to moved)
+        }
+    }
+
     /** Update session status / fields. */
     object UpdateSession : AbstractPostRoute() {
         override val path: String = "/agent/session/update"
