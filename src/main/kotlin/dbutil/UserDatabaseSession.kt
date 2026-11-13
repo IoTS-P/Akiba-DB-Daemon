@@ -281,7 +281,8 @@ class UserDatabaseSession (val instanceName: String) {
         """
 
         const val DATABASE_GET_ALL_MD5_COMMAND = """
-            SELECT checksum FROM binaries UNION SELECT checksum FROM processed_binaries
+            SELECT checksum FROM binaries
+            UNION SELECT processed_checksum FROM binaries WHERE processed_checksum IS NOT NULL
         """
     }
 }

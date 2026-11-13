@@ -35,6 +35,11 @@ CREATE TABLE IF NOT EXISTS binaries (
     arch            TEXT,                   -- architecture
     format          TEXT,                   -- binary format, like ELF, EXE, etc.
     compiler_spec   TEXT,                   -- compiler spec, like eabi, Visual studio, etc.
+    -- Some imports produce a second file (a processed binary). Its path and checksum
+    -- live on the same row; NULL means this binary was never processed.
+    processed_path   TEXT,
+    processed_checksum TEXT,
+    processed_size   INT8,
     -- For files that are imported at runtime by a module while analyzing another file:
     -- `source_id`     records the id of the originating binary (the binary that was being
     --                  analyzed when this file was imported), or NULL if this binary was
@@ -54,30 +59,11 @@ SELECT assert_column_type('public', 'binaries', 'size', 'int8');
 SELECT assert_column_type('public', 'binaries', 'arch', 'text');
 SELECT assert_column_type('public', 'binaries', 'format', 'text');
 SELECT assert_column_type('public', 'binaries', 'compiler_spec', 'text');
+SELECT assert_column_type('public', 'binaries', 'processed_path', 'text');
+SELECT assert_column_type('public', 'binaries', 'processed_checksum', 'text');
+SELECT assert_column_type('public', 'binaries', 'processed_size', 'int8');
 SELECT assert_column_type('public', 'binaries', 'source_id', 'int4');
 SELECT assert_column_type('public', 'binaries', 'source_module', 'text');
-
--- Some binaries are processed when imported and may generate new files, so we need to save them
--- Note: Not all binaries are processed, so this table doesn't contain all ids
-CREATE TABLE IF NOT EXISTS processed_binaries (
-    id              INTEGER REFERENCES binaries (id)
-      ON DELETE CASCADE
-      ON UPDATE CASCADE,
-    original_path   TEXT,                   -- processed file path
-    checksum        TEXT,                   -- file checksum (processed file)
-    size            INT8,                   -- file size (processed file)
-    arch            TEXT,                   -- architecture
-    format          TEXT,                   -- binary format, like ELF, EXE, etc.
-    compiler_spec   TEXT                    -- compiler spec, like eabi, Visual studio, etc.
-);
-
-SELECT assert_column_type('public', 'processed_binaries', 'id', 'int4');
-SELECT assert_column_type('public', 'processed_binaries', 'original_path', 'text');
-SELECT assert_column_type('public', 'processed_binaries', 'checksum', 'text');
-SELECT assert_column_type('public', 'processed_binaries', 'size', 'int8');
-SELECT assert_column_type('public', 'processed_binaries', 'arch', 'text');
-SELECT assert_column_type('public', 'processed_binaries', 'format', 'text');
-SELECT assert_column_type('public', 'processed_binaries', 'compiler_spec', 'text');
 
 -- Create table `results` to save Akiba results
 CREATE TABLE IF NOT EXISTS results (
@@ -98,16 +84,7 @@ CREATE INDEX IF NOT EXISTS idx_results_id ON results(id);
 
 -- Create a view for convenient query in config.yaml
 CREATE OR REPLACE VIEW using_binaries AS
-SELECT COALESCE(b.id, a.id) AS id,
-       COALESCE(b.original_path, a.original_path) AS original_path,
-       COALESCE(b.size, a.size) AS size,
-       COALESCE(b.arch, a.arch) AS arch,
-       COALESCE(b.format, a.format) AS format,
-       COALESCE(b.compiler_spec, a.compiler_spec) AS compiler_spec,
-       COALESCE(b.checksum, a.checksum) AS checksum
-FROM binaries a
-         LEFT JOIN processed_binaries b
-                   ON a.id = b.id;
+SELECT * FROM binaries;
 
 -- Create a table `db_backup_tree` to save backup tree data
 CREATE TABLE IF NOT EXISTS db_backup_tree (

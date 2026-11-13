@@ -13,13 +13,9 @@ import java.util.UUID
 object Insertions {
     const val DATABASE_INSERT_BINARY_COMMAND = """
         INSERT INTO binaries 
-        (original_path, checksum, size, arch, format, compiler_spec, source_id, source_module) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """
-    const val DATABASE_INSERT_PROCESSED_BINARY_COMMAND = """
-        INSERT INTO processed_binaries 
-        (original_path, checksum, size, arch, format, compiler_spec, id) 
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        (original_path, checksum, size, arch, format, compiler_spec, source_id, source_module,
+         processed_path, processed_checksum, processed_size) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
 
     // ============================================================
@@ -68,6 +64,9 @@ object Insertions {
         @Throws(SQLException::class)
         override suspend fun handle(ctx: RouteContext): Any? {
             val data = ctx.receive<InsertData>()
+            val processed = data.processedPath != null || data.processedChecksum != null
+            if (processed && (data.processedPath == null || data.processedChecksum == null))
+                return HttpStatusCode.BadRequest.description("Invalid processed binary data")
             val fa = try {
                 fastAccess(ctx)
             } catch (e: FastAccessException) {
@@ -90,31 +89,21 @@ object Insertions {
                         it.setString(8, data.sourceModule)
                     else
                         it.setNull(8, java.sql.Types.VARCHAR)
+                    it.setString(9, data.processedPath)
+                    it.setString(10, data.processedChecksum)
+                    if (data.processedSize >= 0)
+                        it.setLong(11, data.processedSize)
+                    else
+                        it.setNull(11, java.sql.Types.BIGINT)
                     it.executeUpdate()
                 }
             }
             fa.session.md5List.add(data.checksum)
 
-            val insertedId = fa.session.getLastInsertId()
-
-            if (data.processedPath != null && data.processedChecksum != null) {
-                fa.session.useDb { conn ->
-                    conn.prepareStatement(DATABASE_INSERT_PROCESSED_BINARY_COMMAND).use {
-                        it.setString(1, data.processedPath)
-                        it.setString(2, data.processedChecksum)
-                        it.setLong(3, data.processedSize)
-                        it.setString(4, data.arch)
-                        it.setString(5, data.format)
-                        it.setString(6, data.compilerSpec)
-                        it.setLong(7, insertedId)
-                        it.executeUpdate()
-                    }
-                }
+            if (data.processedChecksum != null)
                 fa.session.md5List.add(data.processedChecksum)
-            } else if (!(data.processedPath == null && data.processedChecksum == null))
-                return HttpStatusCode.BadRequest.description("Invalid processed binary data")
 
-            return insertedId
+            return fa.session.getLastInsertId()
         }
     }
 }

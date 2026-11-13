@@ -119,14 +119,9 @@ object Queries {
 
         const val QUERY_BINARY_SQL: String = """
             SELECT u.original_path original_path, u.arch arch, u.format format, 
-               u.compiler_spec compiler_spec, u.checksum checksum
+               u.compiler_spec compiler_spec, u.checksum checksum,
+               u.processed_path processed_path, u.processed_checksum processed_checksum
             FROM binaries u
-            WHERE u.id = ?
-        """
-
-        const val QUERY_PROCESSED_SQL: String = """
-            SELECT u.original_path original_path, u.checksum checksum
-            FROM processed_binaries u
             WHERE u.id = ?
         """
 
@@ -151,17 +146,8 @@ object Queries {
                         metadata["format"] = rs.getString("format")
                         metadata["compilerSpec"] = rs.getString("compiler_spec")
                         metadata["checksum"] = rs.getString("checksum")
-                    }
-                }
-            }
-
-            fa.session.useDb { conn ->
-                conn.prepareStatement(QUERY_PROCESSED_SQL).use { stmt ->
-                    stmt.setLong(1, id)
-                    val rs = stmt.executeQuery()
-                    if (rs.next()) {
-                        metadata["processedPath"] = rs.getString("original_path")
-                        metadata["processedChecksum"] = rs.getString("checksum")
+                        metadata["processedPath"] = rs.getString("processed_path")
+                        metadata["processedChecksum"] = rs.getString("processed_checksum")
                     }
                 }
             }
@@ -256,8 +242,8 @@ object Queries {
      * Accepts `{ "ids": [1, 2, ...] }`.  Ids are bound through a
      * parameterized `ANY(?)` array — no SQL injection risk.
      *
-     * Deleting from `binaries` cascades to `processed_binaries` and
-     * `results` (both reference `binaries.id` with ON DELETE CASCADE)
+     * Deleting from `binaries` cascades to `results` (it references
+     * `binaries.id` with ON DELETE CASCADE)
      * and resets child rows' `source_id` to NULL (ON DELETE SET NULL),
      * so one statement cleans every FK-linked row in this database.
      * Module-owned result tables and the agent database are NOT touched
