@@ -42,6 +42,12 @@ object AgentOps {
         getObject(columnLabel)?.let { if (it is PGobject) it.value else it.toString() }
 
     /** Read a UUID column from a ResultSet as a String (or null). */
+    /** Postgres uuid[] as a plain list of strings. */
+    private fun ResultSet.getUuidArray(columnLabel: String): List<String> {
+        val raw = runCatching { getArray(columnLabel)?.array }.getOrNull() as? Array<*> ?: return emptyList()
+        return raw.mapNotNull { it?.toString() }
+    }
+
     private fun ResultSet.getUUIDStr(columnLabel: String): String? =
         getString(columnLabel)
 
@@ -163,7 +169,8 @@ object AgentOps {
             fa.session.useDb { conn ->
                 conn.prepareStatement(
                     "SELECT session_id, session_name, status, binary_id, module_name, graph_id, " +
-                    "model_name, project_name, current_program, workflow_id, created_at, updated_at, resumed_at, completed_at, transcript, " +
+                    "model_name, project_name, current_program, current_program_id, program_ids, workflow_id, " +
+                    "created_at, updated_at, resumed_at, completed_at, transcript, " +
                     "parent_session_id, lifecycle, runtime_state, closing_reason " +
                     "FROM agent_sessions WHERE session_id = ?::uuid"
                 ).use { ps ->
@@ -179,6 +186,8 @@ object AgentOps {
                             "modelName" to rs.getString("model_name"),
                             "projectName" to rs.getString("project_name"),
                             "currentProgram" to rs.getString("current_program"),
+                            "currentProgramId" to rs.getUUIDStr("current_program_id"),
+                            "programIds" to rs.getUuidArray("program_ids"),
                             "workflowId" to rs.getString("workflow_id"),
                             "createdAt" to rs.getString("created_at"),
                             "updatedAt" to rs.getString("updated_at"),
@@ -234,6 +243,8 @@ object AgentOps {
                             "modelName" to rs.getString("model_name"),
                             "projectName" to rs.getString("project_name"),
                             "currentProgram" to rs.getString("current_program"),
+                            "currentProgramId" to rs.getUUIDStr("current_program_id"),
+                            "programIds" to rs.getUuidArray("program_ids"),
                             "workflowId" to rs.getString("workflow_id"),
                             "createdAt" to rs.getString("created_at"),
                             "updatedAt" to rs.getString("updated_at"),
@@ -320,7 +331,8 @@ object AgentOps {
 
                 val where = if (conditions.isEmpty()) "" else "WHERE ${conditions.joinToString(" AND ")}"
                 val sql = "SELECT session_id, session_name, status, runtime_state, binary_id, module_name, " +
-                    "model_name, project_name, current_program, workflow_id, created_at, updated_at, parent_session_id " +
+                    "model_name, project_name, current_program, current_program_id, program_ids, workflow_id, " +
+                    "created_at, updated_at, parent_session_id " +
                     "FROM agent_sessions $where " +
                     "ORDER BY updated_at DESC LIMIT ? OFFSET ?"
 
@@ -526,7 +538,8 @@ object AgentOps {
             val sessionName: String? = null,
             val modelName: String? = null,
             val transcript: String? = null,
-            val programName: String? = null
+            val programName: String? = null,
+            val programId: String? = null
         )
 
         override suspend fun handle(ctx: RouteContext): Any? {
@@ -548,6 +561,15 @@ object AgentOps {
             req.modelName?.let { sets.add("model_name = ?"); params.add(it) }
             req.transcript?.let { sets.add("transcript = ?"); params.add(it) }
             req.programName?.let { sets.add("current_program = ?"); params.add(it) }
+            req.programId?.let {
+                sets.add("current_program_id = ?::uuid"); params.add(it)
+                // Accumulate: a conversation may work on several programs over time.
+                sets.add(
+                    "program_ids = (SELECT coalesce(array_agg(DISTINCT x), '{}') " +
+                        "FROM unnest(array_append(program_ids, ?::uuid)) AS x)"
+                )
+                params.add(it)
+            }
 
             if (sets.isEmpty()) return HttpStatusCode.BadRequest.description("Nothing to update")
 

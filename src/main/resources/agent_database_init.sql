@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
     model_name        TEXT,                          -- e.g. "gpt-4o", "claude-3-sonnet"
     project_name      TEXT,                          -- Ghidra project bound to this interactive/automated session
     current_program   TEXT,                          -- program inside that project the session is working on
+    current_program_id UUID,                         -- identity of that program (survives rename/move)
+    program_ids       UUID[] NOT NULL DEFAULT '{}',  -- every program this conversation has touched
     workflow_id       TEXT,                          -- workflow run that spawned this session (null for interactive sessions); children inherit it from their parent
     parent_session_id UUID                           -- self-reference; null for root sessions
                           REFERENCES agent_sessions(session_id)
@@ -72,7 +74,13 @@ SELECT assert_column_type('public', 'agent_sessions', 'model_name',        'text
 ALTER TABLE agent_sessions ADD COLUMN IF NOT EXISTS current_program TEXT;
 
 SELECT assert_column_type('public', 'agent_sessions', 'project_name',      'text');
+-- Idempotent migration for instances created before program identity existed.
+ALTER TABLE agent_sessions ADD COLUMN IF NOT EXISTS current_program_id UUID;
+ALTER TABLE agent_sessions ADD COLUMN IF NOT EXISTS program_ids UUID[] NOT NULL DEFAULT '{}';
+
 SELECT assert_column_type('public', 'agent_sessions', 'current_program',   'text');
+SELECT assert_column_type('public', 'agent_sessions', 'current_program_id', 'uuid');
+SELECT assert_column_type('public', 'agent_sessions', 'program_ids',       '_uuid');
 SELECT assert_column_type('public', 'agent_sessions', 'workflow_id',       'text');
 SELECT assert_column_type('public', 'agent_sessions', 'parent_session_id', 'uuid');
 SELECT assert_column_type('public', 'agent_sessions', 'lifecycle',         'text');
