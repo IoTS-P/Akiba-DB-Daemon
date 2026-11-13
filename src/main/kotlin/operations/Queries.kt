@@ -125,16 +125,10 @@ object Queries {
         """
 
         const val QUERY_PROCESSED_SQL: String = """
-            SELECT u.original_path original_path, u.checksum checksum, u.load_properties load_properties
+            SELECT u.original_path original_path, u.checksum checksum
             FROM processed_binaries u
             WHERE u.id = ?
         """
-
-        data class FileSegment(
-            val oldOffset: Long,
-            val newOffset: Long,
-            val length: Long
-        )
 
         @Throws(SQLException::class)
         override suspend fun handle(ctx: RouteContext): Any? {
@@ -168,9 +162,6 @@ object Queries {
                     if (rs.next()) {
                         metadata["processedPath"] = rs.getString("original_path")
                         metadata["processedChecksum"] = rs.getString("checksum")
-                        val loadProperties = rs.getString("load_properties")
-                        metadata["loadProperties"] =
-                            jacksonObjectMapper().readValue<List<FileSegment>>(loadProperties)
                     }
                 }
             }

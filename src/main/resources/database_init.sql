@@ -66,7 +66,6 @@ CREATE TABLE IF NOT EXISTS processed_binaries (
     original_path   TEXT,                   -- processed file path
     checksum        TEXT,                   -- file checksum (processed file)
     size            INT8,                   -- file size (processed file)
-    load_properties JSONB,                  -- load properties for Akiba (only contains segment info now)
     arch            TEXT,                   -- architecture
     format          TEXT,                   -- binary format, like ELF, EXE, etc.
     compiler_spec   TEXT                    -- compiler spec, like eabi, Visual studio, etc.
@@ -76,7 +75,6 @@ SELECT assert_column_type('public', 'processed_binaries', 'id', 'int4');
 SELECT assert_column_type('public', 'processed_binaries', 'original_path', 'text');
 SELECT assert_column_type('public', 'processed_binaries', 'checksum', 'text');
 SELECT assert_column_type('public', 'processed_binaries', 'size', 'int8');
-SELECT assert_column_type('public', 'processed_binaries', 'load_properties', 'jsonb');
 SELECT assert_column_type('public', 'processed_binaries', 'arch', 'text');
 SELECT assert_column_type('public', 'processed_binaries', 'format', 'text');
 SELECT assert_column_type('public', 'processed_binaries', 'compiler_spec', 'text');
@@ -106,8 +104,7 @@ SELECT COALESCE(b.id, a.id) AS id,
        COALESCE(b.arch, a.arch) AS arch,
        COALESCE(b.format, a.format) AS format,
        COALESCE(b.compiler_spec, a.compiler_spec) AS compiler_spec,
-       COALESCE(b.checksum, a.checksum) AS checksum,
-       b.load_properties AS load_properties
+       COALESCE(b.checksum, a.checksum) AS checksum
 FROM binaries a
          LEFT JOIN processed_binaries b
                    ON a.id = b.id;

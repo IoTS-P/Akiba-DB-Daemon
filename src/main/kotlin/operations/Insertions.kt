@@ -18,8 +18,8 @@ object Insertions {
     """
     const val DATABASE_INSERT_PROCESSED_BINARY_COMMAND = """
         INSERT INTO processed_binaries 
-        (original_path, checksum, size, arch, format, compiler_spec, load_properties, id) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        (original_path, checksum, size, arch, format, compiler_spec, id) 
+        VALUES (?, ?, ?, ?, ?, ?, ?)
     """
 
     // ============================================================
@@ -49,7 +49,6 @@ object Insertions {
             val processedChecksum: String? = null,
             val size: Long,
             val processedSize: Long = -1,
-            val loadProperties: String? = null,
             // Null until the architecture-identification module settles them;
             // setString(pos, null) writes SQL NULL, which the column allows.
             val arch: String? = null,
@@ -98,7 +97,7 @@ object Insertions {
 
             val insertedId = fa.session.getLastInsertId()
 
-            if (data.processedPath != null && data.processedChecksum != null && data.loadProperties != null) {
+            if (data.processedPath != null && data.processedChecksum != null) {
                 fa.session.useDb { conn ->
                     conn.prepareStatement(DATABASE_INSERT_PROCESSED_BINARY_COMMAND).use {
                         it.setString(1, data.processedPath)
@@ -107,17 +106,12 @@ object Insertions {
                         it.setString(4, data.arch)
                         it.setString(5, data.format)
                         it.setString(6, data.compilerSpec)
-                        val obj = org.postgresql.util.PGobject().apply {
-                            type = "jsonb"
-                            this.value = data.loadProperties
-                        }
-                        it.setObject(7, obj)
-                        it.setLong(8, insertedId)
+                        it.setLong(7, insertedId)
                         it.executeUpdate()
                     }
                 }
                 fa.session.md5List.add(data.processedChecksum)
-            } else if (!(data.processedPath == null && data.processedChecksum == null && data.loadProperties == null))
+            } else if (!(data.processedPath == null && data.processedChecksum == null))
                 return HttpStatusCode.BadRequest.description("Invalid processed binary data")
 
             return insertedId
