@@ -75,6 +75,12 @@ abstract class AbstractWebsocketRoute {
                 // the close frame invalid, the client then never sees the code and
                 // reports an opaque failure instead of the real reason.
                 close(CloseReason(e.closeCode, e.message.take(MAX_CLOSE_REASON_CHARS)))
+            } catch(e: IllegalArgumentException) {
+                // A bad instance name (or any other rejected request) is the caller's
+                // mistake: tell them what was wrong instead of "Internal server error".
+                close(CloseReason(CloseReason.Codes.CANNOT_ACCEPT,
+                    (e.message ?: "Invalid request").take(MAX_CLOSE_REASON_CHARS)))
+                globalLogger.warn("Rejected websocket $path: ${e.message}")
             } catch(e: Throwable) {
                 close(CloseReason(CloseReason.Codes.INTERNAL_ERROR, "Internal server error"))
                 globalLogger.error("Internal server error occurred on websocket $path: ${e.message}")
