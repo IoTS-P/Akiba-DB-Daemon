@@ -39,6 +39,13 @@ abstract class AbstractPostRoute {
     // Core handler
     protected abstract suspend fun handle(ctx: RouteContext): Any?
 
+    /** The database name when [e] comes from a database that does not exist. */
+    private fun missingDatabase(e: Throwable): String? =
+        generateSequence(e) { it.cause }
+            .filterIsInstance<java.sql.SQLException>()
+            .mapNotNull { it.message }
+            .firstOrNull { it.contains("database") && it.contains("does not exist") }
+
     open fun registerPost(routing: Routing) {
         routing.post(path) {
             if (disabled) {
@@ -60,6 +67,13 @@ abstract class AbstractPostRoute {
                 call.respond(HttpStatusCode.BadRequest)
                 return@post
             } catch(e: Exception) {
+                // A database that no longer exists is the caller's problem, and the caller
+                // can fix it: say which one is gone instead of a bare 500.
+                missingDatabase(e)?.let { message ->
+                    call.respond(HttpStatusCode.NotFound, mapOf("error" to message))
+                    globalLogger.error("Database missing on POST $path: $message")
+                    return@post
+                }
                 call.respond(HttpStatusCode.InternalServerError)
                 globalLogger.error("Internal server error occurred on POST $path: ${e.message}")
                 globalLogger.error(e.stackTraceToString())
