@@ -291,6 +291,32 @@ SELECT assert_column_type('public', 'agent_session_contexts', 'updated_at',     
 
 -- ----------------------------------------------------------
 
+-- 6.5 agent_graphs
+--    The topology a multi-agent run belongs to.  Nodes and edges below both
+--    reference it, and a session records which graph it is bound to, so the
+--    table has to exist before either of them is created.
+-- ----------------------------------------------------------
+CREATE TABLE IF NOT EXISTS agent_graphs (
+    graph_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id      UUID REFERENCES agent_sessions(session_id)
+                        ON DELETE CASCADE ON UPDATE CASCADE,
+    name            TEXT,                           -- optional human-readable label
+    definition      JSONB NOT NULL DEFAULT '{}',    -- the graph as authored (nodes/edges)
+    state           JSONB NOT NULL DEFAULT '{}',    -- runtime state of the graph engine
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+SELECT assert_column_type('public', 'agent_graphs', 'graph_id',   'uuid');
+SELECT assert_column_type('public', 'agent_graphs', 'session_id', 'uuid');
+SELECT assert_column_type('public', 'agent_graphs', 'name',       'text');
+SELECT assert_column_type('public', 'agent_graphs', 'definition', 'jsonb');
+SELECT assert_column_type('public', 'agent_graphs', 'state',      'jsonb');
+SELECT assert_column_type('public', 'agent_graphs', 'created_at', 'timestamptz');
+SELECT assert_column_type('public', 'agent_graphs', 'updated_at', 'timestamptz');
+
+-- ----------------------------------------------------------
+
 -- 7. agent_graph_nodes
 --    Each node represents an agent within a graph.  The
 --    node's `role` determines how the graph engine routes
