@@ -15,6 +15,23 @@ repositories {
     )
 }
 
+// The generated launcher lists every jar by name, so a jar added to lib/ later — a new
+// runtime dependency, or a hand-swapped build — is invisible to it. A wildcard keeps the
+// launcher working as long as the jar sits in lib/.
+tasks.startScripts {
+    doLast {
+        listOf(unixScript, windowsScript).filter { it.exists() }.forEach { script ->
+            val unix = "CLASSPATH=\$APP_HOME/lib/*"
+            val windows = "set CLASSPATH=%APP_HOME%\\lib\\*"
+            val rewritten = if (script.name.endsWith(".bat"))
+                script.readText().replace(Regex("^set CLASSPATH=.*$", RegexOption.MULTILINE)) { windows }
+            else
+                script.readText().replace(Regex("^CLASSPATH=.*$", RegexOption.MULTILINE)) { unix }
+            script.writeText(rewritten)
+        }
+    }
+}
+
 application {
     mainClass.set("org.iotsplab.akiba.dbDaemon.DatabaseDaemon")
 }
