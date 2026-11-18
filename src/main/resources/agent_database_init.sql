@@ -38,7 +38,6 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
                           ON DELETE SET NULL
                           ON UPDATE CASCADE,         -- the binary being analyzed (nullable for non-binary sessions)
     module_name       TEXT,                          -- the AkibaModule that owns this session
-    graph_id          UUID,                          -- FK → agent_graphs (set after graph is bound)
     model_name        TEXT,                          -- e.g. "gpt-4o", "claude-3-sonnet"
     project_name      TEXT,                          -- Ghidra project bound to this interactive/automated session
     current_program   TEXT,                          -- program inside that project the session is working on
@@ -68,7 +67,6 @@ SELECT assert_column_type('public', 'agent_sessions', 'session_name',      'text
 SELECT assert_column_type('public', 'agent_sessions', 'status',            'text');
 SELECT assert_column_type('public', 'agent_sessions', 'binary_id',         'int4');
 SELECT assert_column_type('public', 'agent_sessions', 'module_name',       'text');
-SELECT assert_column_type('public', 'agent_sessions', 'graph_id',          'uuid');
 SELECT assert_column_type('public', 'agent_sessions', 'model_name',        'text');
 -- Idempotent migration for instances created before the column existed.
 ALTER TABLE agent_sessions ADD COLUMN IF NOT EXISTS current_program TEXT;
@@ -288,133 +286,6 @@ SELECT assert_column_type('public', 'agent_session_contexts', 'environment',    
 SELECT assert_column_type('public', 'agent_session_contexts', 'context_config', 'jsonb');
 SELECT assert_column_type('public', 'agent_session_contexts', 'module_data',    'jsonb');
 SELECT assert_column_type('public', 'agent_session_contexts', 'updated_at',     'timestamptz');
-
--- ----------------------------------------------------------
-
--- 6.5 agent_graphs
---    The topology a multi-agent run belongs to.  Nodes and edges below both
---    reference it, and a session records which graph it is bound to, so the
---    table has to exist before either of them is created.
--- ----------------------------------------------------------
-CREATE TABLE IF NOT EXISTS agent_graphs (
-    graph_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    session_id      UUID REFERENCES agent_sessions(session_id)
-                        ON DELETE CASCADE ON UPDATE CASCADE,
-    name            TEXT,                           -- optional human-readable label
-    definition      JSONB NOT NULL DEFAULT '{}',    -- the graph as authored (nodes/edges)
-    state           JSONB NOT NULL DEFAULT '{}',    -- runtime state of the graph engine
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-SELECT assert_column_type('public', 'agent_graphs', 'graph_id',   'uuid');
-SELECT assert_column_type('public', 'agent_graphs', 'session_id', 'uuid');
-SELECT assert_column_type('public', 'agent_graphs', 'name',       'text');
-SELECT assert_column_type('public', 'agent_graphs', 'definition', 'jsonb');
-SELECT assert_column_type('public', 'agent_graphs', 'state',      'jsonb');
-SELECT assert_column_type('public', 'agent_graphs', 'created_at', 'timestamptz');
-SELECT assert_column_type('public', 'agent_graphs', 'updated_at', 'timestamptz');
-
--- ----------------------------------------------------------
-
--- 7. agent_graph_nodes
---    Each node represents an agent within a graph.  The
---    node's `role` determines how the graph engine routes
---    messages to/from it.
--- ----------------------------------------------------------
-CREATE TABLE IF NOT EXISTS agent_graph_nodes (
-    graph_id        UUID NOT NULL REFERENCES agent_graphs(graph_id)
-                        ON DELETE CASCADE ON UPDATE CASCADE,
-    node_id         TEXT NOT NULL,                  -- unique within the graph
-    node_name       TEXT,                           -- optional human-readable label
-    role            TEXT NOT NULL DEFAULT 'WORKER'  -- SUPERVISOR | WORKER | CRITIC | SYNTHESIZER | GATEKEEPER | CUSTOM
-                        CHECK (role IN ('SUPERVISOR','WORKER','CRITIC','SYNTHESIZER','GATEKEEPER','CUSTOM')),
-    model_name      TEXT,                           -- overrides session-level model
-    system_prompt   TEXT,                           -- system prompt for this agent
-    tools           JSONB NOT NULL DEFAULT '[]',    -- list of tool names available
-    config          JSONB NOT NULL DEFAULT '{}',    -- extra node-specific config
-    PRIMARY KEY (graph_id, node_id)
-);
-
-SELECT assert_column_type('public', 'agent_graph_nodes', 'graph_id',      'uuid');
-SELECT assert_column_type('public', 'agent_graph_nodes', 'node_id',       'text');
-SELECT assert_column_type('public', 'agent_graph_nodes', 'node_name',     'text');
-SELECT assert_column_type('public', 'agent_graph_nodes', 'role',          'text');
-SELECT assert_column_type('public', 'agent_graph_nodes', 'model_name',    'text');
-SELECT assert_column_type('public', 'agent_graph_nodes', 'system_prompt', 'text');
-SELECT assert_column_type('public', 'agent_graph_nodes', 'tools',         'jsonb');
-SELECT assert_column_type('public', 'agent_graph_nodes', 'config',        'jsonb');
-
--- ----------------------------------------------------------
--- 8. agent_graph_edges
---    Directed edges connecting graph nodes.  Edge type
---    determines the semantics of the connection.
--- ----------------------------------------------------------
-CREATE TABLE IF NOT EXISTS agent_graph_edges (
-    graph_id        UUID NOT NULL REFERENCES agent_graphs(graph_id)
-                        ON DELETE CASCADE ON UPDATE CASCADE,
-    edge_id         BIGINT GENERATED ALWAYS AS IDENTITY,
-    source_node     TEXT NOT NULL,                  -- FK implied by (graph_id, node_id)
-    target_node     TEXT NOT NULL,
-    edge_type       TEXT NOT NULL DEFAULT 'DELEGATE' -- DELEGATE | REPORT | COLLABORATE | CRITIQUE | FEEDBACK | BROADCAST | GATE
-                        CHECK (edge_type IN ('DELEGATE','REPORT','COLLABORATE','CRITIQUE','FEEDBACK','BROADCAST','GATE')),
-    condition       TEXT,                           -- optional guard expression
-    priority        INTEGER DEFAULT 0,              -- routing priority (higher = first)
-    config          JSONB NOT NULL DEFAULT '{}',    -- edge-specific config
-    PRIMARY KEY (graph_id, edge_id),
-    FOREIGN KEY (graph_id, source_node) REFERENCES agent_graph_nodes(graph_id, node_id)
-        ON DELETE CASCADE ON UPDATE CASCADE,
-    FOREIGN KEY (graph_id, target_node) REFERENCES agent_graph_nodes(graph_id, node_id)
-        ON DELETE CASCADE ON UPDATE CASCADE
-);
-
-SELECT assert_column_type('public', 'agent_graph_edges', 'graph_id',     'uuid');
-SELECT assert_column_type('public', 'agent_graph_edges', 'edge_id',      'int8');
-SELECT assert_column_type('public', 'agent_graph_edges', 'source_node',  'text');
-SELECT assert_column_type('public', 'agent_graph_edges', 'target_node',  'text');
-SELECT assert_column_type('public', 'agent_graph_edges', 'edge_type',    'text');
-SELECT assert_column_type('public', 'agent_graph_edges', 'condition',    'text');
-SELECT assert_column_type('public', 'agent_graph_edges', 'priority',     'int4');
-SELECT assert_column_type('public', 'agent_graph_edges', 'config',       'jsonb');
-
-CREATE INDEX IF NOT EXISTS idx_agent_graph_edges_graph ON agent_graph_edges(graph_id);
-
--- ----------------------------------------------------------
--- 9. agent_graph_executions
---    Runtime execution log for graph runs.  Each row records
---    one execution cycle (one node activation), enabling
---    step-by-step replay and debugging.
--- ----------------------------------------------------------
-CREATE TABLE IF NOT EXISTS agent_graph_executions (
-    execution_id    BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    graph_id        UUID NOT NULL REFERENCES agent_graphs(graph_id)
-                        ON DELETE CASCADE ON UPDATE CASCADE,
-    session_id      UUID NOT NULL REFERENCES agent_sessions(session_id)
-                        ON DELETE CASCADE ON UPDATE CASCADE,
-    iteration       INTEGER NOT NULL,               -- which cycle/iteration this is
-    node_id         TEXT NOT NULL,                   -- which node was activated
-    input_summary   TEXT,                            -- truncated input sent to the node
-    output_summary  TEXT,                            -- truncated output from the node
-    status          TEXT NOT NULL DEFAULT 'running'  -- running | completed | failed | skipped
-                        CHECK (status IN ('running','completed','failed','skipped')),
-    duration_ms     BIGINT,                          -- wall-clock duration
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-SELECT assert_column_type('public', 'agent_graph_executions', 'execution_id',   'int8');
-SELECT assert_column_type('public', 'agent_graph_executions', 'graph_id',       'uuid');
-SELECT assert_column_type('public', 'agent_graph_executions', 'session_id',     'uuid');
-SELECT assert_column_type('public', 'agent_graph_executions', 'iteration',      'int4');
-SELECT assert_column_type('public', 'agent_graph_executions', 'node_id',        'text');
-SELECT assert_column_type('public', 'agent_graph_executions', 'input_summary',  'text');
-SELECT assert_column_type('public', 'agent_graph_executions', 'output_summary', 'text');
-SELECT assert_column_type('public', 'agent_graph_executions', 'status',         'text');
-SELECT assert_column_type('public', 'agent_graph_executions', 'duration_ms',    'int8');
-SELECT assert_column_type('public', 'agent_graph_executions', 'created_at',     'timestamptz');
-
-CREATE INDEX IF NOT EXISTS idx_agent_graph_executions_session    ON agent_graph_executions(session_id);
-CREATE INDEX IF NOT EXISTS idx_agent_graph_executions_graph_iter ON agent_graph_executions(graph_id, iteration);
-
 -- ----------------------------------------------------------
 -- 10. agent_human_inputs
 --     Pending human-in-the-loop input requests.  When an agent

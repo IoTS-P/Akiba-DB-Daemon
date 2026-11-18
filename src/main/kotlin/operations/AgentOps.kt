@@ -168,7 +168,7 @@ object AgentOps {
             var result: Map<String, Any?>? = null
             fa.session.useDb { conn ->
                 conn.prepareStatement(
-                    "SELECT session_id, session_name, status, binary_id, module_name, graph_id, " +
+                    "SELECT session_id, session_name, status, binary_id, module_name, " +
                     "model_name, project_name, current_program, current_program_id, program_ids, workflow_id, " +
                     "created_at, updated_at, resumed_at, completed_at, transcript, " +
                     "parent_session_id, lifecycle, runtime_state, closing_reason " +
@@ -614,7 +614,7 @@ object AgentOps {
      * Uses a recursive CTE to collect the root session and every
      * child / grandchild / etc.  All rows are deleted in one SQL
      * statement.  The CASCADE FK constraints on dependent tables
-     * (agent_messages, agent_tool_calls, agent_graphs, etc.) ensure
+     * (agent_messages, agent_tool_calls, etc.) ensure
      * a clean removal.
      *
      * The caller (AgentRoutes) is responsible for checking that the
@@ -676,7 +676,7 @@ object AgentOps {
      *
      * All rows are deleted in one SQL statement; the CASCADE FK
      * constraints on dependent tables (agent_messages,
-     * agent_tool_calls, agent_graphs, etc.) ensure a clean removal.
+     * agent_tool_calls, etc.) ensure a clean removal.
      *
      * Used by the Projects page "delete project" flow when the user
      * opts into removing the project's agent sessions as well.
