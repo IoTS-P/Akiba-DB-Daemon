@@ -240,8 +240,11 @@ object ScriptOps {
                     ps.setString(5, req.language)
                     ps.setBoolean(6, req.saveResult ?: true)
                     ps.setLong(7, req.maxOutputSize ?: 0)
+                    // LEAST(COALESCE(?, ?), ?) takes three: the request value, the default and
+                    // the ceiling. The id is the tenth parameter, not the ninth.
                     ps.setLong(8, 10737418240L) // MAX_OUTPUT_SIZE = 10GB
-                    ps.setInt(9, req.scriptId)
+                    ps.setLong(9, 10737418240L)
+                    ps.setInt(10, req.scriptId)
                     ps.executeUpdate()
                 }
             }
