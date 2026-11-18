@@ -22,6 +22,7 @@ object RouteRegistry {
         Queries.SelectIdCount,
         Queries.GetBinaryMetadata,
         Queries.SearchBinaries,
+        Queries.SelectBinariesSQL,
         Queries.GetModuleData,
         Queries.SelectIdInSQL,
         Queries.DeleteBinaries,

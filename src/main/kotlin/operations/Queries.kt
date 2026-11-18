@@ -164,6 +164,51 @@ object Queries {
      *
      * All user input goes through parameterized LIKE patterns — no SQL injection risk.
      */
+    /**
+     * Rows of the binaries table matching a WHERE condition.
+     *
+     * The condition comes from a plan script (`binaries("size > 1024")`), so it is read as
+     * SQL on purpose: the table is one the operator already knows and this deployment is
+     * single-user. It is placed inside a SELECT over the view, and a condition carrying a
+     * statement separator is refused, which is the only way one could become a second
+     * statement.
+     */
+    object SelectBinariesSQL : AbstractPostRoute() {
+        override val path: String = "/get/binaries/sql"
+
+        @Throws(SQLException::class)
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val where = ctx.receive<Map<String, String>>()["where"].orEmpty().trim()
+            if (where.contains(';'))
+                return HttpStatusCode.BadRequest.description("a WHERE condition cannot contain ';'")
+
+            val fa = try {
+                fastAccess(ctx)
+            } catch (e: FastAccessException) {
+                return e.code
+            }
+
+            val clause = if (where.isBlank()) "" else " WHERE ($where)"
+            val sql = "SELECT * FROM using_binaries$clause ORDER BY id"
+            globalLogger.debug(sql)
+
+            val rows = mutableListOf<Map<String, Any?>>()
+            fa.session.useDb { conn ->
+                conn.prepareStatement(sql).use { stmt ->
+                    stmt.executeQuery().use { rs ->
+                        val meta = rs.metaData
+                        while (rs.next()) {
+                            val row = LinkedHashMap<String, Any?>()
+                            for (i in 1..meta.columnCount) row[meta.getColumnName(i)] = rs.getObject(i)
+                            rows.add(row)
+                        }
+                    }
+                }
+            }
+            return rows
+        }
+    }
+
     object SearchBinaries : AbstractPostRoute() {
         override val path: String = "/get/search"
 
