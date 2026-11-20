@@ -35,11 +35,6 @@ CREATE TABLE IF NOT EXISTS binaries (
     arch            TEXT,                   -- architecture
     format          TEXT,                   -- binary format, like ELF, EXE, etc.
     compiler_spec   TEXT,                   -- compiler spec, like eabi, Visual studio, etc.
-    -- Some imports produce a second file (a processed binary). Its path and checksum
-    -- live on the same row; NULL means this binary was never processed.
-    processed_path   TEXT,
-    processed_checksum TEXT,
-    processed_size   INT8,
     -- For files that are imported at runtime by a module while analyzing another file:
     -- `source_id`     records the id of the originating binary (the binary that was being
     --                  analyzed when this file was imported), or NULL if this binary was
@@ -59,9 +54,6 @@ SELECT assert_column_type('public', 'binaries', 'size', 'int8');
 SELECT assert_column_type('public', 'binaries', 'arch', 'text');
 SELECT assert_column_type('public', 'binaries', 'format', 'text');
 SELECT assert_column_type('public', 'binaries', 'compiler_spec', 'text');
-SELECT assert_column_type('public', 'binaries', 'processed_path', 'text');
-SELECT assert_column_type('public', 'binaries', 'processed_checksum', 'text');
-SELECT assert_column_type('public', 'binaries', 'processed_size', 'int8');
 SELECT assert_column_type('public', 'binaries', 'source_id', 'int4');
 SELECT assert_column_type('public', 'binaries', 'source_module', 'text');
 

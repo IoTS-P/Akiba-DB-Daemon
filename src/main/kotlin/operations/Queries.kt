@@ -120,8 +120,7 @@ object Queries {
 
         const val QUERY_BINARY_SQL: String = """
             SELECT u.original_path original_path, u.arch arch, u.format format, 
-               u.compiler_spec compiler_spec, u.checksum checksum, u.size size,
-               u.processed_path processed_path, u.processed_checksum processed_checksum
+               u.compiler_spec compiler_spec, u.checksum checksum, u.size size
             FROM binaries u
             WHERE u.id = ?
         """
@@ -148,8 +147,6 @@ object Queries {
                         metadata["compilerSpec"] = rs.getString("compiler_spec")
                         metadata["checksum"] = rs.getString("checksum")
                         metadata["size"] = rs.getObject("size")
-                        metadata["processedPath"] = rs.getString("processed_path")
-                        metadata["processedChecksum"] = rs.getString("processed_checksum")
                     }
                 }
             }
@@ -474,7 +471,7 @@ object Queries {
         override val path: String = "/set/record"
 
         /** Generated or derived columns: a correction must not rewrite history or identity. */
-        private val READ_ONLY_BINARIES = setOf("id", "size", "checksum", "original_path", "processed_checksum")
+        private val READ_ONLY_BINARIES = setOf("id", "size", "checksum", "original_path")
 
         override suspend fun handle(ctx: RouteContext): Any? {
             val body = runCatching { ctx.receive<Map<String, Any?>>() }.getOrNull()

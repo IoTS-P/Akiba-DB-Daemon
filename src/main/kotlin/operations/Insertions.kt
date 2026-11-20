@@ -13,9 +13,8 @@ import java.util.UUID
 object Insertions {
     const val DATABASE_INSERT_BINARY_COMMAND = """
         INSERT INTO binaries 
-        (original_path, checksum, size, arch, format, compiler_spec, source_id, source_module,
-         processed_path, processed_checksum, processed_size) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (original_path, checksum, size, arch, format, compiler_spec, source_id, source_module)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """
 
     // ============================================================
@@ -40,11 +39,8 @@ object Insertions {
     object InsertBinary : AbstractPostRoute() {
         data class InsertData(
             val originalPath: String,
-            val processedPath: String? = null,
             val checksum: String,
-            val processedChecksum: String? = null,
             val size: Long,
-            val processedSize: Long = -1,
             // Null until the architecture-identification module settles them;
             // setString(pos, null) writes SQL NULL, which the column allows.
             val arch: String? = null,
@@ -64,9 +60,6 @@ object Insertions {
         @Throws(SQLException::class)
         override suspend fun handle(ctx: RouteContext): Any? {
             val data = ctx.receive<InsertData>()
-            val processed = data.processedPath != null || data.processedChecksum != null
-            if (processed && (data.processedPath == null || data.processedChecksum == null))
-                return HttpStatusCode.BadRequest.description("Invalid processed binary data")
             val fa = try {
                 fastAccess(ctx)
             } catch (e: FastAccessException) {
@@ -89,19 +82,10 @@ object Insertions {
                         it.setString(8, data.sourceModule)
                     else
                         it.setNull(8, java.sql.Types.VARCHAR)
-                    it.setString(9, data.processedPath)
-                    it.setString(10, data.processedChecksum)
-                    if (data.processedSize >= 0)
-                        it.setLong(11, data.processedSize)
-                    else
-                        it.setNull(11, java.sql.Types.BIGINT)
                     it.executeUpdate()
                 }
             }
             fa.session.md5List.add(data.checksum)
-
-            if (data.processedChecksum != null)
-                fa.session.md5List.add(data.processedChecksum)
 
             return fa.session.getLastInsertId()
         }
