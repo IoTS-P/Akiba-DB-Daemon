@@ -7,6 +7,7 @@ import org.iotsplab.akiba.dbDaemon.AbstractPostRoute
 import org.iotsplab.akiba.dbDaemon.DatabaseDaemon.Companion.globalLogger
 import org.iotsplab.akiba.dbDaemon.RouteContext
 import org.postgresql.util.PGobject
+import java.sql.ResultSet
 import java.sql.SQLException
 
 object Queries {
@@ -356,6 +357,168 @@ object Queries {
             if (!updated) return HttpStatusCode.NotFound.description("No binary with id $id")
             return mapOf("id" to id, "updated" to columns.map { it.first })
         }
+    }
+
+    /**
+     * Every row that belongs to one binary, table by table.
+     *
+     * A binary id is not only a row in `binaries`: sessions, executions and whatever a
+     * module writes all point at it. Showing only the `binaries` row hid the rest of the
+     * record, which is what a person needs when deciding whether an import was right.
+     */
+    object GetBinaryRecords : AbstractPostRoute() {
+        override val path: String = "/get/binary-records"
+
+        private const val MAX_ROWS_PER_TABLE = 50
+
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val body = runCatching { ctx.receive<Map<String, Any?>>() }.getOrNull()
+                ?: return HttpStatusCode.BadRequest.description("Expected a JSON object")
+            val id = (body["id"] as? Number)?.toLong()
+                ?: return HttpStatusCode.BadRequest.description("'id' is required")
+
+            val fa = try {
+                fastAccess(ctx)
+            } catch (e: FastAccessException) {
+                return e.code
+            }
+
+            val tables = mutableListOf<Map<String, Any?>>()
+            fa.session.useDb { conn ->
+                // Anything that points at a binary, plus the binaries row itself.
+                val candidates = mutableListOf("binaries")
+                conn.prepareStatement(
+                    "SELECT table_name FROM information_schema.columns " +
+                        "WHERE table_schema = 'public' AND column_name = 'binary_id' ORDER BY table_name"
+                ).use { stmt ->
+                    stmt.executeQuery().use { rs ->
+                        while (rs.next()) {
+                            val name = rs.getString(1)
+                            if (name != "binaries") candidates.add(name)
+                        }
+                    }
+                }
+
+                for (table in candidates) {
+                    if (!TABLE_NAME.matches(table)) continue
+                    val columns = mutableListOf<Map<String, String>>()
+                    conn.prepareStatement(
+                        "SELECT column_name, data_type FROM information_schema.columns " +
+                            "WHERE table_schema = 'public' AND table_name = ? ORDER BY ordinal_position"
+                    ).use { stmt ->
+                        stmt.setString(1, table)
+                        stmt.executeQuery().use { rs ->
+                            while (rs.next()) columns.add(
+                                mapOf("name" to rs.getString(1), "type" to rs.getString(2))
+                            )
+                        }
+                    }
+                    if (columns.isEmpty()) continue
+
+                    val where = if (table == "binaries") "id = ?" else "binary_id = ?"
+                    val rows = mutableListOf<Map<String, Any?>>()
+                    conn.prepareStatement("SELECT * FROM $table WHERE $where LIMIT $MAX_ROWS_PER_TABLE")
+                        .use { stmt ->
+                            stmt.setLong(1, id)
+                            stmt.executeQuery().use { rs ->
+                                val meta = rs.metaData
+                                while (rs.next()) {
+                                    val values = linkedMapOf<String, Any?>()
+                                    for (i in 1..meta.columnCount) {
+                                        values[meta.getColumnName(i)] = displayValue(rs, i)
+                                    }
+                                    rows.add(values)
+                                }
+                            }
+                        }
+                    if (rows.isEmpty()) continue
+                    tables.add(mapOf("name" to table, "columns" to columns, "rows" to rows))
+                }
+            }
+            return mapOf("id" to id, "tables" to tables)
+        }
+
+        /** Long text is shortened here: the browser should not receive megabytes. */
+        private fun displayValue(rs: ResultSet, index: Int): Any? {
+            val value = rs.getObject(index) ?: return null
+            return when (value) {
+                is ByteArray -> "<${value.size} bytes>"
+                is String -> if (value.length > MAX_TEXT) value.take(MAX_TEXT) else value
+                else -> value
+            }
+        }
+
+        private const val MAX_TEXT = 4096
+        private val TABLE_NAME = Regex("^[a-z_][a-z0-9_]*$")
+    }
+
+    /**
+     * Change one column of one row.
+     *
+     * The table and column are read from the catalogue, never trusted from the body:
+     * anything not in `information_schema` is refused before a statement is built. Values
+     * are always bound.
+     */
+    object UpdateRecord : AbstractPostRoute() {
+        override val path: String = "/set/record"
+
+        /** Generated or derived columns: a correction must not rewrite history or identity. */
+        private val READ_ONLY_BINARIES = setOf("id", "size", "checksum", "original_path", "processed_checksum")
+
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val body = runCatching { ctx.receive<Map<String, Any?>>() }.getOrNull()
+                ?: return HttpStatusCode.BadRequest.description("Expected a JSON object")
+            val table = (body["table"] as? String)?.trim()
+                ?: return HttpStatusCode.BadRequest.description("'table' is required")
+            val column = (body["column"] as? String)?.trim()
+                ?: return HttpStatusCode.BadRequest.description("'column' is required")
+            val id = (body["id"] as? Number)?.toLong()
+                ?: return HttpStatusCode.BadRequest.description("'id' is required")
+            val value = body["value"] as? String
+                ?: return HttpStatusCode.BadRequest.description("'value' must be a string")
+
+            if (!TABLE_NAME.matches(table) || !TABLE_NAME.matches(column))
+                return HttpStatusCode.BadRequest.description("Unsupported table or column name")
+            if (table == "binaries" && column in READ_ONLY_BINARIES)
+                return HttpStatusCode.BadRequest.description("'$column' cannot be edited")
+            if (value.length > MAX_VALUE_LENGTH)
+                return HttpStatusCode.BadRequest.description("Value is too long")
+
+            val fa = try {
+                fastAccess(ctx)
+            } catch (e: FastAccessException) {
+                return e.code
+            }
+
+            var updated = false
+            fa.session.useDb { conn ->
+                val exists = conn.prepareStatement(
+                    "SELECT data_type FROM information_schema.columns " +
+                        "WHERE table_schema = 'public' AND table_name = ? AND column_name = ?"
+                ).use { stmt ->
+                    stmt.setString(1, table)
+                    stmt.setString(2, column)
+                    stmt.executeQuery().use { rs -> if (rs.next()) rs.getString(1) else null }
+                } ?: return@useDb
+
+                // Numeric columns keep their type; everything else takes the text.
+                val sql = if (exists.contains("int") || exists.contains("numeric") || exists.contains("double"))
+                    "UPDATE $table SET $column = CAST(? AS ${exists}) WHERE id = ? RETURNING id"
+                else
+                    "UPDATE $table SET $column = ? WHERE id = ? RETURNING id"
+
+                conn.prepareStatement(sql).use { stmt ->
+                    stmt.setString(1, value)
+                    stmt.setLong(2, id)
+                    stmt.executeQuery().use { rs -> updated = rs.next() }
+                }
+            }
+            if (!updated) return HttpStatusCode.NotFound.description("No row $id in $table")
+            return mapOf("table" to table, "column" to column, "id" to id, "updated" to true)
+        }
+
+        private const val MAX_VALUE_LENGTH = 100_000
+        private val TABLE_NAME = Regex("^[a-z_][a-z0-9_]*$")
     }
 
     object DeleteBinaries : AbstractPostRoute() {
