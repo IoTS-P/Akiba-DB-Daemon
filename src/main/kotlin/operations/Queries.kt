@@ -424,10 +424,23 @@ object Queries {
                                 val meta = rs.metaData
                                 while (rs.next()) {
                                     val values = linkedMapOf<String, Any?>()
+                                    val lengths = linkedMapOf<String, Int>()
                                     for (i in 1..meta.columnCount) {
-                                        values[meta.getColumnName(i)] = displayValue(rs, i)
+                                        val name = meta.getColumnName(i)
+                                        val raw = rs.getObject(i)
+                                        values[name] = displayValue(raw)
+                                        // The browser gets a prefix, so the real length
+                                        // travels beside it — a value cut at 4 KB would
+                                        // otherwise never look like the megabyte it is.
+                                        val trueLength = when (raw) {
+                                            null -> 0
+                                            is String -> raw.length
+                                            is ByteArray -> raw.size
+                                            else -> 0
+                                        }
+                                        if (trueLength > MAX_TEXT) lengths[name] = trueLength
                                     }
-                                    rows.add(values)
+                                    rows.add(mapOf("values" to values, "lengths" to lengths))
                                 }
                             }
                         }
@@ -439,13 +452,11 @@ object Queries {
         }
 
         /** Long text is shortened here: the browser should not receive megabytes. */
-        private fun displayValue(rs: ResultSet, index: Int): Any? {
-            val value = rs.getObject(index) ?: return null
-            return when (value) {
-                is ByteArray -> "<${value.size} bytes>"
-                is String -> if (value.length > MAX_TEXT) value.take(MAX_TEXT) else value
-                else -> value
-            }
+        private fun displayValue(value: Any?): Any? = when (value) {
+            null -> null
+            is ByteArray -> "<${value.size} bytes>"
+            is String -> if (value.length > MAX_TEXT) value.take(MAX_TEXT) else value
+            else -> value
         }
 
         private const val MAX_TEXT = 4096
