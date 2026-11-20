@@ -119,7 +119,7 @@ object Queries {
 
         const val QUERY_BINARY_SQL: String = """
             SELECT u.original_path original_path, u.arch arch, u.format format, 
-               u.compiler_spec compiler_spec, u.checksum checksum,
+               u.compiler_spec compiler_spec, u.checksum checksum, u.size size,
                u.processed_path processed_path, u.processed_checksum processed_checksum
             FROM binaries u
             WHERE u.id = ?
@@ -146,6 +146,7 @@ object Queries {
                         metadata["format"] = rs.getString("format")
                         metadata["compilerSpec"] = rs.getString("compiler_spec")
                         metadata["checksum"] = rs.getString("checksum")
+                        metadata["size"] = rs.getObject("size")
                         metadata["processedPath"] = rs.getString("processed_path")
                         metadata["processedChecksum"] = rs.getString("processed_checksum")
                     }
@@ -297,6 +298,66 @@ object Queries {
      * Returns the ids that were actually deleted (unknown ids are
      * silently skipped).  At most 500 ids per call.
      */
+    /**
+     * Correct the recorded metadata of a binary.
+     *
+     * The importer guesses: an unrecognised format comes in as `arch = "n/a"`, and Ghidra
+     * then cannot pick a language. Letting the row be corrected is the difference between
+     * a two-minute fix and a psql session inside the container.
+     *
+     * Only these three columns can be written, they are whitelisted by name, and each
+     * value is bound as a parameter — nothing here builds SQL from the request body.
+     */
+    object UpdateBinaryMetadata : AbstractPostRoute() {
+        override val path: String = "/set/binary-metadata"
+
+        /** Longest value each column accepts; the schema has no limit, the UI does. */
+        private const val MAX_VALUE_LENGTH = 200
+
+        override suspend fun handle(ctx: RouteContext): Any? {
+            val body = runCatching { ctx.receive<Map<String, Any?>>() }.getOrNull()
+                ?: return HttpStatusCode.BadRequest.description("Expected a JSON object")
+            val id = (body["id"] as? Number)?.toLong()
+                ?: return HttpStatusCode.BadRequest.description("'id' is required")
+
+            val columns = listOf("arch", "format", "compilerSpec")
+                .mapNotNull { key ->
+                    val value = body[key] as? String ?: return@mapNotNull null
+                    val column = when (key) {
+                        "arch" -> "arch"
+                        "format" -> "format"
+                        else -> "compiler_spec"
+                    }
+                    if (value.length > MAX_VALUE_LENGTH)
+                        return HttpStatusCode.BadRequest.description("'$key' is too long")
+                    column to value.trim()
+                }
+            if (columns.isEmpty())
+                return HttpStatusCode.BadRequest.description(
+                    "Nothing to update: send arch, format or compilerSpec")
+
+            val assignments = columns.joinToString(", ") { "${it.first} = ?" }
+            val sql = "UPDATE binaries SET $assignments WHERE id = ? RETURNING id"
+
+            val fa = try {
+                fastAccess(ctx)
+            } catch (e: FastAccessException) {
+                return e.code
+            }
+
+            var updated = false
+            fa.session.useDb { conn ->
+                conn.prepareStatement(sql).use { stmt ->
+                    columns.forEachIndexed { index, pair -> stmt.setString(index + 1, pair.second) }
+                    stmt.setLong(columns.size + 1, id)
+                    stmt.executeQuery().use { rs -> updated = rs.next() }
+                }
+            }
+            if (!updated) return HttpStatusCode.NotFound.description("No binary with id $id")
+            return mapOf("id" to id, "updated" to columns.map { it.first })
+        }
+    }
+
     object DeleteBinaries : AbstractPostRoute() {
         override val path: String = "/delete/binaries"
 

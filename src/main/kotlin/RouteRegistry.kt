@@ -26,6 +26,7 @@ object RouteRegistry {
         Queries.GetModuleData,
         Queries.SelectIdInSQL,
         Queries.DeleteBinaries,
+        Queries.UpdateBinaryMetadata,
 
         Insertions.MD5Exists,
         Insertions.InsertBinary,
